@@ -19,9 +19,9 @@ hatter edit
   CREDENTIALS  ·  one Claude login each. Bars are capacity left, then time to reset;
      the dot is red spent, amber under half a session, green above.
 
- ▸  a ● claude-1@work.com     5h ░░░░░░   0%   2h   7d █████░  87%  19h  -> project1
+ ▸  a ● claude-1@work.com     5h ░░░░░░   0%   2h   7d █████░  87%  19h  -> dev
     b ● claude-2@work.com     5h ██░░░░  34%   1h   7d ████░░  66%   2d
-    c ● claude-3@work.com     5h ██████ 100%   4h   7d █████░  82%   2d  -> project2
+    c ● claude-3@work.com     5h ██████ 100%   4h   7d █████░  82%   2d  -> ops
     d ● claude-4@work.com     5h ████░░  71%  40m   7d ██████  95%   3d
     e ● claude-5@work.com     5h ██████ 100%   5h   7d ██████ 100%   5d
     f ● me@personal.com       5h ███░░░  46%   1h   7d ████░░  71%   2d  -> personal
@@ -29,9 +29,9 @@ hatter edit
   HATS  ·  a hat is a login (user@host): one ssh connection,
      one tmux server, one cmux window.
 
-    1 ^ project1    you@shell.work.com         ● up 3 ws ● claude-1@work.com
-    2 ^ project2    you@project2-dev.work.com  ○ down    ● claude-3@work.com
-    3 ^ personal    you@box.personal.com       ● up 1 ws ● me@personal.com
+    1 ^ dev         you@shell.work.com       ● up 3 ws ● claude-1@work.com
+    2 ^ ops         you@ops.work.com         ○ down    ● claude-3@work.com
+    3 ^ personal    you@box.personal.com     ● up 1 ws ● me@personal.com
 ```
 
 ## The model
@@ -68,9 +68,9 @@ restore.
   Nothing is written to disk on either side, and no shell server is ever asked
   to log in. One login can sit on as many hats as you like — `creds push a
   --all` puts it on every one — while a hat holds exactly one at a time,
-  because Claude Code reads a single credentials file. Above, `project1` and
-  `project2` draw on the same pool of five work logins while `personal` keeps
-  its own — the `->` column says which hats hold what right now.
+  because Claude Code reads a single credentials file. Above, `dev` and `ops`
+  draw on the same pool of five work logins while `personal` keeps its own —
+  the `->` column says which hats hold what right now.
 - **Autosave and backup.** Rolling snapshots of the config plus one frozen
   checkpoint per 8 hours; `hatter backup` is a real git commit to a remote you
   control.
@@ -101,8 +101,8 @@ headless mode.
 git clone https://github.com/<you>/hatter
 install -m 755 hatter/bin/hatter ~/.local/bin/hatter
 
-hatter hat add project1 --ssh you@shell.work.com
-hatter provision project1
+hatter hat add dev --ssh you@shell.work.com
+hatter provision dev
 hatter atlas --group "Atlas"
 ```
 
