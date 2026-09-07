@@ -2201,15 +2201,20 @@ edit_nav() {
 
 edit_top() {
     local SEL=1 nc nh nt i idx hat host state sess cred credstate dot
-    local letter slot email label r5 r7 e5 e7 active
+    local letter slot email label r5 r7 e5 e7 active holders
     while :; do
         CLETTER=(); CEMAIL=(); CMETA=(); CICON=(); nc=0
         while IFS=$'\t' read -r letter slot email label r5 r7 e5 e7 active; do
             [[ -z "$email" ]] && continue
             CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
             CICON[$nc]=$(creds_dot "$r5" "$r7")
-            CMETA[$nc]=$(printf '%s%s' \
+            # Which hats hold this login. A login is not tied to one hat -
+            # push it to as many as you want - and this is the only place the
+            # many side of that is visible.
+            holders=$(creds_hats_holding "$email")
+            CMETA[$nc]=$(printf '%s%s%s' \
                 "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
+                "${holders:+  ${C_DIM}-> $holders${C_R}}" \
                 "${active:+  ${C_CY}<- active on this Mac${C_R}}")
             nc=$((nc+1))
         done < <(creds_rows)
