@@ -71,7 +71,7 @@ tool. The plan for what comes next — a typed port, a client-adapter interface 
 it is not tied to one terminal, Windows and Linux clients — is in
 [EPIC.md](EPIC.md) and [issues/](issues/).
 
-Client support today is [cmux](https://github.com/skorokithakis/cmux); the
+Client support today is [cmux](https://cmux.com); the
 adapter interface (issue 2) is the keystone that opens it to WezTerm, wmux and a
 headless mode.
 

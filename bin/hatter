@@ -202,7 +202,7 @@ register_hat() {
         [[ -t 0 ]] || die "unknown hat '$hat' and no --ssh given (not a tty, cannot prompt)"
         echo
         echo "No shell server is mapped to the '$hat' prefix."
-        read -r -p "  ssh destination (e.g. ${hat}@dev.example.org): " ssh_dest
+        read -r -p "  ssh destination (e.g. ${hat}@dev.example.com): " ssh_dest
         [[ -n "$ssh_dest" ]] || die "no ssh destination given"
     fi
     if [[ -z "$dir" ]]; then
