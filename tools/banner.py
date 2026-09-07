@@ -91,7 +91,7 @@ shelf(5,  [box(8,  "bash",   (114, "#87d787"))])
 shelf(9,  [box(14, "claude", (173, "#d7875f"))])
 shelf(13, [box(20, "codex",   (75, "#5fafff"))])
 shelf(17, [box(14, "tmux",    (73, "#5fafaf")), box(14, "ssh", (145, "#afafaf"))])
-shelf(21, [box(12, "vim",    (114, "#87d787")), box(12, "git", (168, "#d75f87")), box(12, "htop", (140, "#af87d7"))])
+shelf(21, [box(16, "cmux",   (140, "#af87d7")), box(14, "git", (168, "#d75f87"))])
 
 plain, ansi = [], []
 for r in range(ROWS):

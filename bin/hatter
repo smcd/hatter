@@ -43,14 +43,30 @@ warn() { echo "  !! $*" >&2; }
 # multiplexing is dropped rather than trusted.
 HATTER_SSH_CTL="/tmp/.hatter-ssh-$(id -u)"
 SSH_OPTS=()
-if mkdir -p "$HATTER_SSH_CTL" 2>/dev/null \
-   && [[ -O "$HATTER_SSH_CTL" ]] \
+# -O follows a symlink, so a link planted by someone else pointing at a
+# directory we do own would pass it. Test the link itself, before and after.
+if [[ ! -L "$HATTER_SSH_CTL" ]] \
+   && mkdir -p "$HATTER_SSH_CTL" 2>/dev/null \
+   && [[ -d "$HATTER_SSH_CTL" && -O "$HATTER_SSH_CTL" && ! -L "$HATTER_SSH_CTL" ]] \
    && chmod 700 "$HATTER_SSH_CTL" 2>/dev/null; then
     SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$HATTER_SSH_CTL/%C" -o ControlPersist=600)
 fi
 
 # Single-quote a value for safe interpolation into a remote sh command.
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# A remote directory. The config's default is the literal string "$HOME", which
+# only means anything if the remote shell gets to expand it - single-quoting it
+# like any other argument asks tmux for a directory named "$HOME". Exactly two
+# forms are let through unquoted; everything else is a literal path.
+sq_dir() {
+    case "$1" in
+        '$HOME'|'~')  printf '"$HOME"' ;;
+        '$HOME/'*)    printf '"$HOME"%s' "$(sq "${1#\$HOME}")" ;;
+        '~/'*)        printf '"$HOME"%s' "$(sq "${1#\~}")" ;;
+        *)            sq "$1" ;;
+    esac
+}
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
@@ -62,11 +78,17 @@ LOCK_DIR="$CONFIG_DIR/.lock"
 HATTER_LOCK_HELD=0
 LOCK_STALE_SECONDS=300
 
+# BSD and GNU stat spell this differently, and a lock whose age cannot be read
+# is treated as fresh - clearing a lock you cannot date is how two writers end
+# up in the config at once.
+lock_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
 hatter_lock() {
-    local tries="${1:-0}" i=0 age owner
+    local tries="${1:-0}" i=0 age owner mtime
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
-        if [[ "$age" -gt "$LOCK_STALE_SECONDS" ]]; then
+        mtime=$(lock_mtime "$LOCK_DIR")
+        age=$(( $(date +%s) - mtime ))
+        if [[ "$mtime" -gt 0 && "$age" -gt "$LOCK_STALE_SECONDS" ]]; then
             owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '?')
             warn "clearing a stale config lock (pid $owner, ${age}s old)"
             rm -rf "$LOCK_DIR"
@@ -86,11 +108,27 @@ hatter_unlock() {
     HATTER_LOCK_HELD=0
 }
 
+# Every config write lands here, which makes this the one place that has to
+# hold the lock. Commands take it in the dispatch and keep it for their whole
+# run; edit mode and `autosave restore` do not, and without this the once-a-
+# minute timer could sync on top of them. A failed jq leaves the config alone
+# rather than truncating it.
 jq_write() {
-    local tmp
+    local tmp held=0
+    if [[ "$HATTER_LOCK_HELD" != 1 ]]; then
+        hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
+        held=1
+    fi
     tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX")
-    jq "$@" < "$CONFIG" > "$tmp"
-    mv "$tmp" "$CONFIG"
+    if jq "$@" < "$CONFIG" > "$tmp"; then
+        mv "$tmp" "$CONFIG"
+    else
+        rm -f "$tmp"
+        [[ "$held" == 1 ]] && hatter_unlock
+        die "config update failed - $CONFIG is unchanged"
+    fi
+    [[ "$held" == 1 ]] && hatter_unlock
+    return 0
 }
 
 cfg() { jq -r "$@" < "$CONFIG"; }
@@ -167,7 +205,17 @@ migrate_config() {
 # -------------------------------------------------------------- config reads
 
 hat_exists() { [[ -n "$(cfg --arg l "$1" '.hats[$l] // empty')" ]]; }
-hat_ssh()    { cfg --arg l "$1" '.hats[$l].ssh // empty'; }
+# "-oProxyCommand=..." is a valid ssh argument and would run whatever it says.
+# A destination is never an option, so anything that looks like one is refused
+# rather than handed to ssh.
+ssh_dest_ok() { case "$1" in -*) return 1 ;; *) return 0 ;; esac; }
+
+hat_ssh() {
+    local d
+    d=$(cfg --arg l "$1" '.hats[$l].ssh // empty')
+    ssh_dest_ok "$d" || die "hat '$1' has an ssh destination starting with '-' ($d)"
+    printf '%s' "$d"
+}
 hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
 hat_names()  { cfg '.hats | keys[]?'; }
 hat_default_group() { cfg --arg l "$1" '.hats[$l].default_group // empty'; }
@@ -205,6 +253,7 @@ register_hat() {
         read -r -p "  ssh destination (e.g. ${hat}@dev.example.com): " ssh_dest
         [[ -n "$ssh_dest" ]] || die "no ssh destination given"
     fi
+    ssh_dest_ok "$ssh_dest" || die "ssh destination cannot start with '-': $ssh_dest"
     if [[ -z "$dir" ]]; then
         [[ -t 0 ]] && read -r -p "  remote working dir [\$HOME]: " dir || true
         [[ -n "$dir" ]] || dir='$HOME'
@@ -272,7 +321,7 @@ ensure_remote_session() {
 
     if [[ "$n" -eq 0 ]]; then
         info "Creating tmux session '$session' on $host"
-        remote_sh "$host" "tmux new-session -d -s $(sq "$session") -c $(sq "$dir")"
+        remote_sh "$host" "tmux new-session -d -s $(sq "$session") -c $(sq_dir "$dir")"
         return 0
     fi
 
@@ -283,10 +332,10 @@ ensure_remote_session() {
         nameopt=""
         [[ -n "${name:-}" ]] && nameopt="-n $(sq "$name")"
         if [[ $first -eq 1 ]]; then
-            cmd="tmux new-session -d -s $(sq "$session") $nameopt -c $(sq "$cwd")"
+            cmd="tmux new-session -d -s $(sq "$session") $nameopt -c $(sq_dir "$cwd")"
             first=0
         else
-            cmd="tmux new-window -d -t $(sq "=$session") $nameopt -c $(sq "$cwd")"
+            cmd="tmux new-window -d -t $(sq "=$session") $nameopt -c $(sq_dir "$cwd")"
         fi
         remote_sh "$host" "$cmd"
     done < <(jq -r '.[] | [.name, .cwd] | @tsv' <<<"$windows")
@@ -629,7 +678,7 @@ def write_private(path, text):
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d, 0o700)
-    tmp = path + ".hat-creds.tmp"
+    tmp = "%s.hat-creds.%d.tmp" % (path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
@@ -687,10 +736,18 @@ def install():
     oauth_account = (acct.get("config") or {}).get("oauthAccount")
     if isinstance(oauth_account, dict):
         conf = read_json(CONF)
-        if not isinstance(conf, dict):
-            conf = {}
-        conf["oauthAccount"] = oauth_account
-        write_private(CONF, json.dumps(conf, indent=2) + "\n")
+        if conf is None and os.path.exists(CONF):
+            # The file is there but unreadable or not JSON. Rewriting it would
+            # throw away every project, history entry and onboarding flag it
+            # holds, so leave it: the credential itself is already installed and
+            # only the displayed account name is affected.
+            sys.stderr.write("hat-creds: %s exists but could not be parsed - "
+                             "leaving it alone\n" % CONF)
+        else:
+            if not isinstance(conf, dict):
+                conf = {}
+            conf["oauthAccount"] = oauth_account
+            write_private(CONF, json.dumps(conf, indent=2) + "\n")
 
     print("installed %s (%s) as %s" % (email, kind, CRED))
 
@@ -1062,7 +1119,7 @@ $listing
 
     local nameopt=""
     [[ -n "$name" ]] && nameopt="-n $(sq "$name")"
-    remote_sh "$host" "tmux new-window -t $(sq "=$session") $nameopt -c $(sq "$dir")"
+    remote_sh "$host" "tmux new-window -t $(sq "=$session") $nameopt -c $(sq_dir "$dir")"
     info "Added a tab to '$session' on $host${name:+ (named '$name')}"
 }
 
@@ -1587,7 +1644,12 @@ autosave_install() {
     # rather than anywhere standard - so the directories are taken from where
     # the tools actually are on this machine, not guessed.
     extra=""
-    for d in "$(dirname "$(command -v cmux)")" "$(dirname "$(command -v jq)")"; do
+    for d in "$(command -v cmux || true)" "$(command -v jq || true)"; do
+        # dirname of an empty string is "." - a tool that is not installed must
+        # contribute nothing rather than putting the working directory on the
+        # PATH of a job that runs every minute.
+        [[ -n "$d" ]] || continue
+        d=$(dirname "$d")
         case ":$extra:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" in
             *":$d:"*) ;;
             *) extra="$extra$d:" ;;
@@ -1677,7 +1739,12 @@ cmd_autosave() {
             local n="${1:-}"
             [[ -n "$n" ]] || die "usage: hatter autosave restore <n|latest>   (see: hatter autosave list)"
             local f
-            if [[ "$n" == "latest" ]]; then f=$(autosave_latest); else f=$(autosave_files | sed -n "${n}p"); fi
+            if [[ "$n" == "latest" ]]; then
+                f=$(autosave_latest)
+            else
+                [[ "$n" =~ ^[0-9]+$ ]] || die "restore takes a number or 'latest' - see: hatter autosave list"
+                f=$(autosave_files | sed -n "${n}p")
+            fi
             [[ -n "$f" && -f "$f" ]] || die "no autosave '$n' - see: hatter autosave list"
             jq -e . < "$f" >/dev/null 2>&1 || die "autosave #$n is not valid JSON: $f"
             # The config being replaced is itself worth keeping.
@@ -2050,7 +2117,7 @@ edit_windows() {
     local hat="$1" session="$2" host
     host=$(hat_ssh "$hat")
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-        "tmux list-windows -t '=$session' -F '#{window_index}	#{window_name}	#{window_active}	#{window_panes}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}' 2>/dev/null" \
+        "tmux list-windows -t $(sq "=$session") -F '#{window_index}	#{window_name}	#{window_active}	#{window_panes}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}' 2>/dev/null" \
         2>/dev/null
 }
 

@@ -1,2 +1,5 @@
 *.bak
 .DS_Store
+banner.txt
+banner.ansi
+__pycache__/

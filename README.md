@@ -20,15 +20,15 @@ hatter edit
      the dot is red spent, amber under half a session, green above.
 
  ▸  a ● you@work.com                  5h ░░░░░░   0%   2h   7d █████░  87%  19h
-    b ● you@personal.com              5h ███░░░  46%   1h   7d ████░░  71%   2d
-    c ● you@github.com                5h ██████ 100%   4h   7d █████░  86%   2d
+    b ● me@personal.com               5h ███░░░  46%   1h   7d ████░░  71%   2d
+    c ● dev@github.com                5h ██████ 100%   4h   7d █████░  86%   2d
 
   HATS  ·  a hat is a login (user@host): one ssh connection,
      one tmux server, one cmux window.
 
     1 ^ work        you@shell.work.com       ● up 3 ws ● you@work.com
-    2 ^ personal    you@box.personal.com     ● up 1 ws ● you@personal.com
-    3 ^ project     you@dev.github.com       ○ down    ● you@github.com
+    2 ^ personal    you@box.personal.com     ● up 1 ws ● me@personal.com
+    3 ^ project     you@dev.github.com       ○ down    ● dev@github.com
 ```
 
 ## The model
