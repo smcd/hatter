@@ -26,6 +26,7 @@ hatter
   CREDENTIALS  ·  one Claude login each. Bars are capacity left,
      then time to reset; red is spent, amber under half a session.
 
+        LOGIN                 5H WINDOW             7D WINDOW            HELD BY
     a ● claude-1@work.com     5h ░░░░░░   0%   2h   7d █████░  87%  19h  -> dev
     b ● claude-2@work.com     5h ██░░░░  34%   1h   7d ████░░  66%   2d
     c ● claude-3@work.com     5h ██████ 100%   4h   7d █████░  82%   2d  -> ops
