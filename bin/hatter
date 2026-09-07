@@ -218,6 +218,48 @@ hat_ssh() {
 }
 hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
 hat_names()  { cfg '.hats | keys[]?'; }
+
+# Each hat gets a colour, so the same hat looks the same everywhere it appears
+# - the rack, and the cmux group headers under it. Eight names rather than free
+# hex: a name maps to both a terminal colour and the hex cmux wants, and eight
+# is as many as anyone can tell apart at a glance.
+HAT_COLOURS='amber green cyan blue violet rose teal slate'
+hat_colour_ansi() {
+    case "$1" in
+        amber) printf 179 ;; green) printf 114 ;; cyan)  printf  73 ;; blue)  printf  75 ;;
+        violet) printf 140 ;; rose) printf 168 ;; teal)  printf  66 ;; slate) printf 145 ;;
+        *) printf 145 ;;
+    esac
+}
+hat_colour_hex() {
+    case "$1" in
+        amber) printf '#d7af5f' ;; green) printf '#87d787' ;; cyan)  printf '#5fafaf' ;;
+        blue)  printf '#5fafff' ;; violet) printf '#af87d7' ;; rose) printf '#d75f87' ;;
+        teal)  printf '#5f8f8f' ;; slate) printf '#afafaf' ;; *) printf '#afafaf' ;;
+    esac
+}
+
+# An unassigned hat gets one from its own name, not from its position in the
+# list - adding a hat must not recolour the ones already there.
+hat_colour() {
+    local c i
+    c=$(cfg --arg l "$1" '.hats[$l].color // empty')
+    if [[ -z "$c" ]]; then
+        i=$(( $(printf '%s' "$1" | cksum | awk '{print $1}') % 8 ))
+        c=$(printf '%s' "$HAT_COLOURS" | cut -d' ' -f$((i+1)))
+    fi
+    printf '%s' "$c"
+}
+
+# The hat icon in its own colour. A tiny silhouette - crown and brim - which at
+# three characters is as close to a hat as a terminal gets.
+hat_icon() {
+    if [[ -n "${C_R:-}" ]]; then
+        printf '\033[38;5;%sm/_\\\033[0m' "$(hat_colour_ansi "$(hat_colour "$1")")"
+    else
+        printf '/_\\'
+    fi
+}
 hat_default_group() { cfg --arg l "$1" '.hats[$l].default_group // empty'; }
 
 group_exists() { [[ -n "$(cfg --arg g "$1" '.groups[$g] // empty')" ]]; }
@@ -506,8 +548,14 @@ discard_stray_workspace() {
 }
 
 apply_group_style() {
-    local group="$1" ref="$2" color icon pinned collapsed
+    local group="$1" ref="$2" color icon pinned collapsed hat
     color=$(cfg --arg g "$group" '.groups[$g].color // empty')
+    # A group with a colour of its own keeps it; one without inherits its hat's,
+    # so the sidebar shows at a glance which hat a group belongs to.
+    if [[ -z "$color" || "$color" == "null" ]]; then
+        hat=$(group_hat "$group")
+        [[ -n "$hat" ]] && color=$(hat_colour_hex "$(hat_colour "$hat")")
+    fi
     icon=$(cfg --arg g "$group" '.groups[$g].icon // empty')
     pinned=$(cfg --arg g "$group" '.groups[$g].pinned // false')
     collapsed=$(cfg --arg g "$group" '.groups[$g].collapsed // false')
@@ -1817,7 +1865,18 @@ creds_rows() {
         | @tsv' 2>/dev/null || true
 }
 
-# A short bar of remaining capacity.
+# Neither Anthropic nor OpenAI publishes a colour convention for these windows,
+# so this is hatter's own and it is the one already used by the dot: green above
+# half a window, amber below it, red once it is spent. Dot and bar agreeing
+# matters more than matching some other tool.
+creds_colour() {
+    if   [[ "$1" -le 0 ]];  then printf '%s' "$C_RD"
+    elif [[ "$1" -lt 50 ]]; then printf '%s' "$C_YL"
+    else                         printf '%s' "$C_GR"
+    fi
+}
+
+# A short bar of remaining capacity, filled in that colour.
 creds_bar() {
     local pct="$1" w="${2:-6}" filled i out=""
     filled=$(( (pct * w + 50) / 100 ))
@@ -1828,7 +1887,7 @@ creds_bar() {
         # part of the variable name
         if [[ $i -lt $filled ]]; then out="${out}█"; else out="${out}░"; fi
     done
-    printf '%s' "$out"
+    printf '%s%s%s' "$(creds_colour "$pct")" "$out" "$C_R"
 }
 
 # Time until a window resets, at one significant unit: minutes under an hour,
@@ -1845,11 +1904,9 @@ creds_eta() {
 
 # Red when a window is spent, amber under half a 5-hour session, green above it.
 creds_dot() {
-    local r5="$1" r7="$2"
-    if   [[ "$r5" -le 0 || "$r7" -le 0 ]]; then printf '%s●%s' "$C_RD" "$C_R"
-    elif [[ "$r5" -lt 50 ]];               then printf '%s●%s' "$C_YL" "$C_R"
-    else                                        printf '%s●%s' "$C_GR" "$C_R"
-    fi
+    local r5="$1" r7="$2" worst="$1"
+    [[ "$r7" -lt "$worst" ]] && worst="$r7"
+    printf '%s●%s' "$(creds_colour "$worst")" "$C_R"
 }
 
 # 5h and 7d remaining, as bar + percent + time to reset.
@@ -2011,7 +2068,7 @@ KEY=""
 # Row icons, kept together so the set can be changed in one place. The hat is a
 # plain caret - at one character a silhouette reads better than a detailed
 # emoji, and ^ needs no font support anywhere.
-ICON_HAT="^"
+ICON_HAT="/_\\"   # replaced per row by hat_icon, which colours it
 ICON_GROUP="📂"
 ICON_WORKSPACE="📁"
 ICON_TAB="⌨️"
@@ -2034,12 +2091,30 @@ edit_cleanup() {
 # Read one keypress. Arrow keys arrive as ESC [ A..D, so a bare ESC has to be
 # told apart from the start of a sequence by a short timeout. bash 3.2's read
 # only takes whole-second timeouts, hence -t 1.
+# Whatever is already in the tty buffer, up to <n> bytes, giving up after about
+# a tenth of a second. bash 3.2 - which is the bash macOS ships - has no
+# fractional read timeout, so `read -t 1` is the shortest wait it can offer and
+# a bare Esc sat there for a full second. VTIME is in tenths, and a 0-byte read
+# ends dd, so this returns the moment the terminal has nothing more to say.
+EDIT_TTY_MODE=""
+edit_read_pending() {
+    local out
+    # bash restores the tty itself after each `read -s -n1`, so the mode to go
+    # back to is the same every time and is worth asking for only once.
+    [[ -n "$EDIT_TTY_MODE" ]] || EDIT_TTY_MODE=$(stty -g < /dev/tty)
+    stty -icanon min 0 time 1 < /dev/tty
+    out=$(dd bs=1 count="$1" 2>/dev/null < /dev/tty)
+    stty "$EDIT_TTY_MODE" < /dev/tty
+    printf '%s' "$out"
+}
+
 edit_readkey() {
     local k rest
     IFS= read -rsn1 k < /dev/tty || { KEY=quit; return; }
     case "$k" in
         $'\e')
-            if IFS= read -rsn2 -t 1 rest < /dev/tty; then
+            rest=$(edit_read_pending 2)
+            if [[ -n "$rest" ]]; then
                 case "$rest" in
                     '[A') KEY=up ;;    '[B') KEY=down ;;
                     '[C') KEY=right ;; '[D') KEY=left ;;
@@ -2200,88 +2275,100 @@ edit_nav() {
 # through both; a letter or a digit jumps straight into either one.
 
 edit_top() {
-    local SEL=1 nc nh nt i idx hat host state sess cred credstate dot
+    local SEL=1 nc nh nt i idx hat host state sess cred credstate dot dirty=1
     local letter slot email label r5 r7 e5 e7 active holders
     while :; do
-        CLETTER=(); CEMAIL=(); CMETA=(); CICON=(); nc=0
-        while IFS=$'\t' read -r letter slot email label r5 r7 e5 e7 active; do
-            [[ -z "$email" ]] && continue
-            CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
-            CICON[$nc]=$(creds_dot "$r5" "$r7")
-            # Which hats hold this login. A login is not tied to one hat -
-            # push it to as many as you want - and this is the only place the
-            # many side of that is visible.
-            holders=$(creds_hats_holding "$email")
-            CMETA[$nc]=$(printf '%s%s%s' \
-                "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
-                "${holders:+  ${C_DIM}-> $holders${C_R}}" \
-                "${active:+  ${C_CY}<- active on this Mac${C_R}}")
-            nc=$((nc+1))
-        done < <(creds_rows)
+        # Gathering is what costs: `cswap list --json` alone is ~300ms, and
+        # every hat row is several more jq reads on top. It happens only when
+        # something has actually changed, so moving the highlight re-renders
+        # from arrays already in hand - which is what makes the arrows instant.
+        if [[ "$dirty" == 1 ]]; then
+            CLETTER=(); CEMAIL=(); CMETA=(); CICON=(); nc=0
+            while IFS=$'\t' read -r letter slot email label r5 r7 e5 e7 active; do
+                [[ -z "$email" ]] && continue
+                CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
+                CICON[$nc]=$(creds_dot "$r5" "$r7")
+                # Which hats hold this login. A login is not tied to one hat -
+                # push it to as many as you want - and this is the only place
+                # the many side of that is visible.
+                holders=$(creds_hats_holding "$email")
+                CMETA[$nc]=$(printf '%s%s%s' \
+                    "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
+                    "${holders:+  ${C_DIM}-> $holders${C_R}}" \
+                    "${active:+  ${C_CY}<- active on this Mac${C_R}}")
+                nc=$((nc+1))
+            done < <(creds_rows)
 
-        HATS=(); nh=0
-        while IFS= read -r hat; do
-            [[ -z "$hat" ]] && continue
-            HATS[$nh]="$hat"; nh=$((nh+1))
-        done < <(hat_names)
+            HATS=(); HICON=(); HMETA=(); nh=0
+            while IFS= read -r hat; do
+                [[ -z "$hat" ]] && continue
+                host=$(hat_ssh "$hat")
+                if [[ -s "$(edit_sessions_file "$hat")" ]]; then
+                    sess=$(wc -l < "$(edit_sessions_file "$hat")" | tr -d ' ')
+                    state=$(printf '%s● up%s %s ws' "$C_GR" "$C_R" "$sess")
+                elif [[ -f "$(edit_sessions_file "$hat")" ]]; then
+                    state=$(printf '%s○ no tmux%s' "$C_YL" "$C_R")
+                else
+                    state=$(printf '%s?  unprobed%s' "$C_DIM" "$C_R")
+                fi
+                cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
+                # Reuse the credential's own dot so a hat shows the health of
+                # the account it is actually holding.
+                dot=""
+                idx=0
+                while [[ $idx -lt $nc ]]; do
+                    [[ "${CEMAIL[$idx]}" == "$cred" ]] && { dot="${CICON[$idx]} "; break; }
+                    idx=$((idx+1))
+                done
+                case "$credstate" in
+                    ok|stale) cred=$(printf '%s%s%s%s' "$dot" "$C_DIM" "${cred%%@*}" "$C_R") ;;
+                    dead)     cred=$(printf '%s%s%s dead%s' "$dot" "$C_RD" "${cred%%@*}" "$C_R") ;;
+                    none)     cred=$(printf '%sno credential%s' "$C_DIM" "$C_R") ;;
+                    *)        cred=$(printf '%snot provisioned%s' "$C_YL" "$C_R") ;;
+                esac
+                HATS[$nh]="$hat"
+                HICON[$nh]=$(printf '%b' "$(hat_icon "$hat")")
+                HMETA[$nh]=$(printf '%s%-24s%s %-14s %s' "$C_DIM" "$host" "$C_R" "$state" "$cred")
+                nh=$((nh+1))
+            done < <(hat_names)
+            dirty=0
+        fi
 
         nt=$((nc+nh))
         [[ $SEL -gt $nt ]] && SEL=$nt
         [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "" "CREDENTIALS" \
-            "one Claude login each. Bars are capacity left, then time to reset;" \
-            "the dot is red spent, amber under half a session, green above."
+        # Hats first: the tool is named for them, and a login only matters
+        # because some hat is wearing it.
+        edit_header "" "HATS" \
+            "a hat is a login (user@host): one ssh connection," \
+            "one tmux server, one cmux window."
+
+        i=0
+        while [[ $i -lt $nh ]]; do
+            ROW_LABEL="$((i+1))"; ROW_ICON="${HICON[$i]}"
+            edit_row $((i+1)) "$SEL" "${HATS[$i]}" 11 "${HMETA[$i]}"
+            i=$((i+1))
+        done
+        ROW_LABEL=""; ROW_ICON=""
+        [[ $nh -eq 0 ]] && printf '   %s(no hats yet - press A to add one)%s\n' "$C_DIM" "$C_R"
+
+        printf '\n  %sCREDENTIALS%s  %s·  one Claude login each. Bars are capacity left,%s\n' \
+            "$C_B" "$C_R" "$C_DIM" "$C_R"
+        printf '     %sthen time to reset; red is spent, amber under half a session.%s\n\n' \
+            "$C_DIM" "$C_R"
 
         i=0
         while [[ $i -lt $nc ]]; do
             ROW_LABEL="${CLETTER[$i]}"; ROW_ICON="${CICON[$i]}"
-            edit_row $((i+1)) "$SEL" "${CEMAIL[$i]}" 28 "${CMETA[$i]}"
+            edit_row $((nh+i+1)) "$SEL" "${CEMAIL[$i]}" 28 "${CMETA[$i]}"
             i=$((i+1))
         done
         ROW_LABEL=""; ROW_ICON=""
         [[ $nc -eq 0 ]] && \
             printf '   %s(no credentials - is cswap installed?)%s\n' "$C_DIM" "$C_R"
 
-        printf '\n  %sHATS%s  %s·  a hat is a login (user@host): one ssh connection,%s\n' \
-            "$C_B" "$C_R" "$C_DIM" "$C_R"
-        printf '     %sone tmux server, one cmux window.%s\n\n' "$C_DIM" "$C_R"
-
-        i=0
-        while [[ $i -lt $nh ]]; do
-            hat="${HATS[$i]}"; host=$(hat_ssh "$hat")
-            if [[ -s "$(edit_sessions_file "$hat")" ]]; then
-                sess=$(wc -l < "$(edit_sessions_file "$hat")" | tr -d ' ')
-                state=$(printf '%s● up%s %s ws' "$C_GR" "$C_R" "$sess")
-            elif [[ -f "$(edit_sessions_file "$hat")" ]]; then
-                state=$(printf '%s○ no tmux%s' "$C_YL" "$C_R")
-            else
-                state=$(printf '%s?  unprobed%s' "$C_DIM" "$C_R")
-            fi
-            cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
-            # Reuse the credential's own dot so a hat shows the health of the
-            # account it is actually holding.
-            dot=""
-            idx=0
-            while [[ $idx -lt $nc ]]; do
-                [[ "${CEMAIL[$idx]}" == "$cred" ]] && { dot="${CICON[$idx]} "; break; }
-                idx=$((idx+1))
-            done
-            case "$credstate" in
-                ok|stale) cred=$(printf '%s%s%s%s' "$dot" "$C_DIM" "${cred%%@*}" "$C_R") ;;
-                dead)     cred=$(printf '%s%s%s dead%s' "$dot" "$C_RD" "${cred%%@*}" "$C_R") ;;
-                none)     cred=$(printf '%sno credential%s' "$C_DIM" "$C_R") ;;
-                *)        cred=$(printf '%snot provisioned%s' "$C_YL" "$C_R") ;;
-            esac
-            ROW_LABEL="$((i+1))"; ROW_ICON="$ICON_HAT"
-            edit_row $((nc+i+1)) "$SEL" "$hat" 11 \
-                "$(printf '%s%-24s%s %-14s %s' "$C_DIM" "$host" "$C_R" "$state" "$cred")"
-            i=$((i+1))
-        done
-        ROW_ICON=""
-        [[ $nh -eq 0 ]] && printf '   %s(no hats yet - press A to add one)%s\n' "$C_DIM" "$C_R"
-
-        printf '\n  %s↑↓ move   a-z credential   1-9 hat   → enter open   q quit%s\n' \
+        printf '\n  %s↑↓ move   1-9 hat   a-z credential   → enter open   q quit%s\n' \
             "$C_DIM" "$C_R"
         printf '  %sA add hat   R rename   D forget   P provision   ! refresh%s\n' \
             "$C_DIM" "$C_R"
@@ -2295,31 +2382,33 @@ edit_top() {
         case "$KEY" in
             q|Q|quit) return 0 ;;
             [1-9])
-                [[ "$KEY" -le $nh ]] && SEL=$((nc + KEY))
+                [[ "$KEY" -le $nh ]] && SEL=$KEY
                 continue ;;
+            esc|left|back) continue ;;      # nothing above this level
             [a-z])
                 # Only a letter that is actually in the credential column is a
                 # jump; anything else falls through to the action keys below.
                 i=0
                 while [[ $i -lt $nc ]]; do
-                    if [[ "${CLETTER[$i]}" == "$KEY" ]]; then SEL=$((i+1)); break; fi
+                    if [[ "${CLETTER[$i]}" == "$KEY" ]]; then SEL=$((nh+i+1)); break; fi
                     i=$((i+1))
                 done
                 [[ $i -lt $nc ]] && continue ;;
         esac
         edit_nav "$KEY" "$nt" && continue
 
+        # Past here the key is an action, and an action can change anything.
+        dirty=1
         idx=$((SEL-1))
-        if [[ $idx -lt $nc ]]; then hat=""; else hat="${HATS[$((idx-nc))]:-}"; fi
+        if [[ $idx -lt $nh ]]; then hat="${HATS[$idx]:-}"; else hat=""; fi
 
         case "$KEY" in
             q|Q|quit) return 0 ;;
-            left|esc|back) : ;;                       # nothing above this level
             enter|right)
-                if [[ $idx -lt $nc && $nc -gt 0 ]]; then
-                    edit_credential "${CEMAIL[$idx]}" || return 0
-                elif [[ -n "$hat" ]]; then
+                if [[ -n "$hat" ]]; then
                     edit_groups "$hat" || return 0
+                elif [[ $nc -gt 0 ]]; then
+                    edit_credential "${CEMAIL[$((idx-nh))]}" || return 0
                 fi
                 : ;;
             !) edit_refresh_all ;;
@@ -2378,7 +2467,7 @@ edit_credential() {
             else
                 held=$(printf '%sholds %s%s' "$C_DIM" "$cred" "$C_R")
             fi
-            ROW_LABEL=""; ROW_ICON="$ICON_HAT"
+            ROW_LABEL=""; ROW_ICON=$(printf '%b' "$(hat_icon "$hat")")
             edit_row $((i+1)) "$SEL" "$hat" 11 \
                 "$(printf '%s%-24s%s %s' "$C_DIM" "$host" "$C_R" "$held")"
             i=$((i+1))
