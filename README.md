@@ -12,7 +12,7 @@ sessions on servers you already own; the terminal on your desk is a disposable
 projection of them, rebuilt from a single config file.
 
 ```
-hatter edit
+hatter
 ```
 
 ```
@@ -74,7 +74,8 @@ restore.
 - **Autosave and backup.** Rolling snapshots of the config plus one frozen
   checkpoint per 8 hours; `hatter backup` is a real git commit to a remote you
   control.
-- **An interactive browser** that names each level as you walk it, so the
+- **The hat rack.** `hatter` on its own opens an interactive walk down
+  hat › group › workspace › tab, naming each level as you go, so the
   vocabulary is learned by looking around.
 
 ## Status

@@ -2146,7 +2146,7 @@ edit_short_path() {
 
 edit_header() {
     printf '\033[?25l\033[H\033[2J'
-    printf '%s──── hatter edit ──────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
+    printf '%s──── hatter rack ──────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
     printf '  %s%s%s\n' "$C_CY" "${1:-all hats}" "$C_R"
     printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
     printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$2" "$C_R" "$C_DIM" "$3" "$C_R"
@@ -2613,8 +2613,8 @@ edit_tabs() {
     done
 }
 
-cmd_edit() {
-    [[ -t 0 && -t 1 ]] || die "edit needs an interactive terminal"
+cmd_rack() {
+    [[ -t 0 && -t 1 ]] || die "the rack needs an interactive terminal"
     colour_setup
     EDIT_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/hatter-edit.XXXXXX")
     trap edit_cleanup EXIT INT TERM
@@ -2640,7 +2640,7 @@ Commands:
   rename <old> <new>     Rename a session on its server, in cmux and in config
   hat <subcommand>       Manage hats (shell servers)
   group <subcommand>     Manage groups (projects)
-  edit                   Interactive browser: navigate and edit every level
+  rack                   The hat rack: browse and edit every level
   creds <subcommand>     Push a Claude login from this Mac to a hat
   autosave <subcommand>  Rolling config snapshots, and the timer that takes them
   list                   Show the whole hat / group / workspace tree
@@ -2649,6 +2649,7 @@ Commands:
   provision <hat>        Set up tmux persistence on a shell server
   backup [message]       sync, then commit and push the config to git
 
+Run `hatter` with no arguments to open the rack.
 Run `hatter <command>` or `hatter help <command>` for a command's options.
 
 Config: ~/.config/hatter/config.json
@@ -2796,10 +2797,11 @@ Subcommands:
   hatter group add "Atlas" --hat dev
 USAGE
     ;;
-    edit) cat <<'USAGE'
-hatter edit
+    rack|edit) cat <<'USAGE'
+hatter rack     (or just: hatter)
 
-An interactive walk down the whole structure:
+The hat rack - where every hat hangs. An interactive walk down the whole
+structure:
 
   hat  >  group  >  workspace  >  tab
 
@@ -2813,6 +2815,9 @@ each one, and live status is shown where it exists:
 
 Keys are shown at the bottom of each screen. `!` re-probes the servers, `b`
 goes back a level, `q` quits from anywhere. Takes no options.
+
+`hatter` on its own opens the rack. `hatter edit` is the old name and still
+works.
 USAGE
     ;;
     list) cat <<'USAGE'
@@ -2912,7 +2917,7 @@ cmd="${1:-}"
 shift || true
 
 case "$cmd" in
-    edit|list|ls|help|""|-h|--help|autosave) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
        trap hatter_unlock EXIT ;;
 esac
@@ -2925,7 +2930,11 @@ for a in "$@"; do
 done
 
 case "$cmd" in
-    ""|-h|--help)  usage_main; exit 0 ;;
+    -h|--help)     usage_main; exit 0 ;;
+    # The front door. A tool whose question is "which hat are you wearing?"
+    # should answer it when you type its name - but only at a terminal, so a
+    # script that runs bare `hatter` still gets usage rather than a UI.
+    "")            if [[ -t 0 && -t 1 ]]; then cmd_rack; else usage_main; exit 0; fi ;;
     help)          cmd_help "${1:-}" ;;
 
     # These need arguments, so bare invocation shows the command's options.
@@ -2938,7 +2947,7 @@ case "$cmd" in
     group)     [[ $# -gt 0 ]] || { usage_cmd group; exit 1; };     cmd_group "$@" ;;
 
     # These are meaningful with no arguments, so they just run.
-    edit)      cmd_edit "$@" ;;
+    rack|edit) cmd_rack "$@" ;;
     creds|cred|credential|credentials) cmd_creds "$@" ;;
     autosave)  cmd_autosave "$@" ;;
     list|ls)   cmd_list "$@" ;;
