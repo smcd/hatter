@@ -1,0 +1,2882 @@
+#!/usr/bin/env bash
+#
+# hatter - drive cmux windows/groups/workspaces from remote tmux sessions.
+#
+#   cmux window     <-> a hat (user@host); one ssh connection, one tmux server
+#   workspace group <-> a project / area within that hat
+#   workspace       <-> a tmux session, named "<hat-prefix>-<subproject>"
+#   tab             <-> a tmux window inside that session
+#
+# The hat prefix on a session name is what picks the window and the ssh
+# connection, so a side project can live under your main hat as
+# "dev-website-parser" and still land in the dev window.
+#
+# State lives in ~/.config/hatter/config.json so a reboot of the Mac or of
+# any shell server can be walked back to the previous layout.
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hatter"
+CONFIG="$CONFIG_DIR/config.json"
+
+export CMUX_QUIET=1
+
+# cmux terminals export these, and the CLI treats them as the default target for
+# any command without an explicit --window/--workspace. This script drives
+# windows other than the one it was launched from, so drop them and rely on
+# explicit flags plus focus-window instead.
+unset CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID
+
+# ---------------------------------------------------------------- utilities
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "  !! $*" >&2; }
+
+# hatter opens a lot of short ssh connections - a sync touches every hat, and
+# the autosave timer repeats that on a schedule. Multiplexing them over one
+# persistent connection per host turns a ~2s handshake into a few milliseconds.
+# Kept inside hatter rather than in ~/.ssh/config so nothing outside it changes.
+# Deliberately /tmp and not TMPDIR: a control socket path has a hard 104-byte
+# limit, and macOS hands every process a ~50-character TMPDIR, which blows it.
+# The directory is per-uid and 0700; if it exists but belongs to someone else,
+# multiplexing is dropped rather than trusted.
+HATTER_SSH_CTL="/tmp/.hatter-ssh-$(id -u)"
+SSH_OPTS=()
+if mkdir -p "$HATTER_SSH_CTL" 2>/dev/null \
+   && [[ -O "$HATTER_SSH_CTL" ]] \
+   && chmod 700 "$HATTER_SSH_CTL" 2>/dev/null; then
+    SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$HATTER_SSH_CTL/%C" -o ControlPersist=600)
+fi
+
+# Single-quote a value for safe interpolation into a remote sh command.
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# The autosave timer syncs from the live client once a minute, and a sync is a
+# read-then-write of the whole config. Without a lock it can be reading while an
+# interactive command writes, and then put the pre-change version back. mkdir is
+# the atomic primitive here; a lock left behind by a killed run goes stale.
+LOCK_DIR="$CONFIG_DIR/.lock"
+HATTER_LOCK_HELD=0
+LOCK_STALE_SECONDS=300
+
+hatter_lock() {
+    local tries="${1:-0}" i=0 age owner
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
+        if [[ "$age" -gt "$LOCK_STALE_SECONDS" ]]; then
+            owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '?')
+            warn "clearing a stale config lock (pid $owner, ${age}s old)"
+            rm -rf "$LOCK_DIR"
+            continue
+        fi
+        i=$((i+1))
+        [[ "$i" -gt "$tries" ]] && return 1
+        sleep 1
+    done
+    echo "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+    HATTER_LOCK_HELD=1
+    return 0
+}
+
+hatter_unlock() {
+    [[ "$HATTER_LOCK_HELD" == 1 ]] && rm -rf "$LOCK_DIR"
+    HATTER_LOCK_HELD=0
+}
+
+jq_write() {
+    local tmp
+    tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX")
+    jq "$@" < "$CONFIG" > "$tmp"
+    mv "$tmp" "$CONFIG"
+}
+
+cfg() { jq -r "$@" < "$CONFIG"; }
+
+backup_config() {
+    [[ -f "$CONFIG" ]] || return 0
+    cp "$CONFIG" "$CONFIG.bak"
+}
+
+# ------------------------------------------------------------------- config
+
+seed_config() {
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f "$CONFIG" ]]; then
+        info "Seeding $CONFIG"
+        cat > "$CONFIG" <<'JSON'
+{
+  "version": 3,
+  "hats": {},
+  "groups": {}
+}
+JSON
+    fi
+    migrate_config
+}
+
+# v1 stored host/remote_dir per group. v2 hoisted those into named entries.
+# v3 renames those entries to "hats" - which hat are you wearing right now.
+migrate_config() {
+    local v
+    v=$(cfg '.version // 1')
+    [[ "$v" -ge 3 ]] && return 0
+
+    backup_config
+
+    if [[ "$v" -lt 2 ]]; then
+        info "Migrating config to v2 (per-hat windows)"
+        jq_write '
+            def prefix_of: split("@")[0];
+            . as $in
+            | ($in.groups // {}) as $g
+            | {
+                version: 2,
+                logins: ( $g
+                          | to_entries
+                          | map(select(.value.host))
+                          | map({ key: (.value.host | prefix_of),
+                                  value: { ssh: .value.host,
+                                           remote_dir: (.value.remote_dir // "$HOME") } })
+                          | from_entries ),
+                groups: ( $g
+                          | to_entries
+                          | map({ key: .key,
+                                  value: { login: (.value.host // "" | prefix_of),
+                                           color: .value.color,
+                                           icon: .value.icon,
+                                           pinned: (.value.pinned // false),
+                                           collapsed: (.value.collapsed // false),
+                                           sessions: (.value.sessions // {}) } })
+                          | from_entries )
+              }
+        '
+    fi
+
+    info "Migrating config to v3 (hats)"
+    jq_write '
+        { version: 3,
+          hats: (.hats // .logins // {}),
+          groups: ( (.groups // {})
+                    | map_values(. + {hat: (.hat // .login)} | del(.login)) ) }
+    '
+}
+
+# -------------------------------------------------------------- config reads
+
+hat_exists() { [[ -n "$(cfg --arg l "$1" '.hats[$l] // empty')" ]]; }
+hat_ssh()    { cfg --arg l "$1" '.hats[$l].ssh // empty'; }
+hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
+hat_names()  { cfg '.hats | keys[]?'; }
+hat_default_group() { cfg --arg l "$1" '.hats[$l].default_group // empty'; }
+
+group_exists() { [[ -n "$(cfg --arg g "$1" '.groups[$g] // empty')" ]]; }
+group_hat()  { cfg --arg g "$1" '.groups[$g].hat // empty'; }
+group_names()  { cfg '.groups | keys[]?'; }
+groups_of_hat() { cfg --arg l "$1" '.groups | to_entries[] | select(.value.hat == $l) | .key'; }
+
+# Which hat owns a session: an explicit config entry wins, otherwise the
+# session-name prefix decides.
+session_hat() {
+    local session="$1" found
+    found=$(cfg --arg s "$session" '
+        .groups | to_entries[] | select(.value.sessions[$s]) | .value.hat' | head -1)
+    [[ -n "$found" ]] && { printf '%s' "$found"; return 0; }
+    local prefix="${session%%-*}"
+    hat_exists "$prefix" && printf '%s' "$prefix"
+    return 0
+}
+
+session_group() {
+    cfg --arg s "$1" '.groups | to_entries[] | select(.value.sessions[$s]) | .key' | head -1
+}
+
+# --------------------------------------------------------------- config writes
+
+register_hat() {
+    local hat="$1" ssh_dest="${2:-}" dir="${3:-}" defgroup="${4:-}"
+
+    if [[ -z "$ssh_dest" ]]; then
+        [[ -t 0 ]] || die "unknown hat '$hat' and no --ssh given (not a tty, cannot prompt)"
+        echo
+        echo "No shell server is mapped to the '$hat' prefix."
+        read -r -p "  ssh destination (e.g. ${hat}@dev.example.org): " ssh_dest
+        [[ -n "$ssh_dest" ]] || die "no ssh destination given"
+    fi
+    if [[ -z "$dir" ]]; then
+        [[ -t 0 ]] && read -r -p "  remote working dir [\$HOME]: " dir || true
+        [[ -n "$dir" ]] || dir='$HOME'
+    fi
+
+    backup_config
+    jq_write --arg l "$hat" --arg s "$ssh_dest" --arg d "$dir" --arg g "$defgroup" '
+        .hats[$l] = ((.hats[$l] // {}) + {ssh: $s, remote_dir: $d})
+        | if $g == "" then . else .hats[$l].default_group = $g end
+    '
+    info "Hat '$hat' -> $ssh_dest ($dir)${defgroup:+, default group '$defgroup'}"
+}
+
+register_group() {
+    local group="$1" hat="$2"
+    backup_config
+    jq_write --arg g "$group" --arg l "$hat" '
+        .groups[$g] = ((.groups[$g] // {sessions: {}}) + {hat: $l})
+        | .groups[$g].sessions //= {}
+    '
+}
+
+remember_session() {
+    local group="$1" session="$2"
+    jq_write --arg g "$group" --arg s "$session" '.groups[$g].sessions[$s] //= {windows: []}'
+}
+
+# --------------------------------------------------------------- remote tmux
+
+remote_sh() {
+    # -n so ssh cannot swallow the stdin of a calling loop.
+    local host="$1"; shift
+    ssh -n "${SSH_OPTS[@]}" -o ConnectTimeout=10 "$host" "$@"
+}
+
+remote_sh_stdin() {
+    local host="$1"; shift
+    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=10 "$host" "$@"
+}
+
+remote_session_exists() {
+    remote_sh "$1" "tmux has-session -t $(sq "=$2")" >/dev/null 2>&1
+}
+
+remote_sessions() {
+    remote_sh "$1" "tmux list-sessions -F '#S' 2>/dev/null || true"
+}
+
+remote_windows_json() {
+    local host="$1" session="$2"
+    local fmt=$'#{window_name}\t#{pane_current_path}'
+    remote_sh "$host" \
+        "tmux list-windows -t $(sq "=$session") -F $(sq "$fmt") 2>/dev/null || true" \
+    | jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {name: .[0], cwd: (.[1] // null)})'
+}
+
+ensure_remote_session() {
+    # ensure_remote_session <host> <session> <default-dir> [windows-json]
+    local host="$1" session="$2" dir="$3" windows="${4:-[]}"
+
+    remote_session_exists "$host" "$session" && return 0
+
+    local n
+    n=$(jq 'length' <<<"$windows")
+
+    if [[ "$n" -eq 0 ]]; then
+        info "Creating tmux session '$session' on $host"
+        remote_sh "$host" "tmux new-session -d -s $(sq "$session") -c $(sq "$dir")"
+        return 0
+    fi
+
+    info "Recreating tmux session '$session' on $host ($n windows)"
+    local first=1 name cwd cmd nameopt
+    while IFS=$'\t' read -r name cwd; do
+        [[ -z "${cwd:-}" || "$cwd" == "null" ]] && cwd="$dir"
+        nameopt=""
+        [[ -n "${name:-}" ]] && nameopt="-n $(sq "$name")"
+        if [[ $first -eq 1 ]]; then
+            cmd="tmux new-session -d -s $(sq "$session") $nameopt -c $(sq "$cwd")"
+            first=0
+        else
+            cmd="tmux new-window -d -t $(sq "=$session") $nameopt -c $(sq "$cwd")"
+        fi
+        remote_sh "$host" "$cmd"
+    done < <(jq -r '.[] | [.name, .cwd] | @tsv' <<<"$windows")
+}
+
+# ----------------------------------------------------------- cmux primitives
+
+# Refs like workspace:3 are window-scoped and collide across windows, so every
+# id this script stores or passes around is a UUID.
+cmux_json() { cmux --id-format both "$@" --json; }
+
+window_ids() { cmux list-windows --json | jq -r '.[].id'; }
+
+groups_in_window() {
+    cmux_json workspace-group list --window "$1" 2>/dev/null | jq -r '.groups[]?.name'
+}
+
+group_ref_in_window() {
+    cmux_json workspace-group list --window "$1" 2>/dev/null \
+        | jq -r --arg n "$2" '.groups[]? | select(.name == $n) | .id' | head -1
+}
+
+titles_in_window() {
+    cmux_json workspace list --window "$1" 2>/dev/null | jq -r '.workspaces[]?.title // empty'
+}
+
+workspace_ref_by_title() {
+    # workspace_ref_by_title <title> [window]  - window omitted means any window
+    local title="$1" win="${2:-}" w id
+    if [[ -n "$win" ]]; then
+        cmux_json workspace list --window "$win" 2>/dev/null \
+            | jq -r --arg t "$title" '.workspaces[]? | select(.title == $t) | .id' | head -1
+        return 0
+    fi
+    for w in $(window_ids); do
+        id=$(cmux_json workspace list --window "$w" 2>/dev/null \
+             | jq -r --arg t "$title" '.workspaces[]? | select(.title == $t) | .id' | head -1)
+        [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+    done
+    return 0
+}
+
+# A cmux window has no name of its own (`cmux rename-window` actually renames
+# the selected workspace), so a hat's window has to be identified by what is
+# inside it. Group names are not unique across windows, so score each window:
+# a workspace whose title is one of this hat's sessions, or which carries the
+# hat prefix, is much stronger evidence than a matching group name.
+find_hat_window() {
+    local hat="$1" w best="" best_score=0 score
+    local wanted titles names t g
+
+    wanted=$(cfg --arg l "$hat" '
+        .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys[]?')
+
+    for w in $(window_ids); do
+        score=0
+        titles=$(titles_in_window "$w")
+        names=$(groups_in_window "$w")
+
+        while IFS= read -r t; do
+            [[ -z "$t" ]] && continue
+            [[ "$t" == "$hat"-* ]] && score=$((score + 5))
+            if [[ -n "$wanted" ]] && grep -qxF "$t" <<<"$wanted"; then
+                score=$((score + 10))
+            fi
+        done <<<"$titles"
+
+        while IFS= read -r g; do
+            [[ -z "$g" ]] && continue
+            [[ "$(group_hat "$g")" == "$hat" ]] && score=$((score + 1))
+        done <<<"$names"
+
+        if [[ $score -gt $best_score ]]; then
+            best_score=$score
+            best="$w"
+        fi
+    done
+
+    printf '%s' "$best"
+}
+
+# Set by ensure_hat_window when it opens a window: the placeholder workspace
+# cmux seeds a new window with, to be closed once a real one has landed.
+NEW_WINDOW_STRAY=""
+
+ensure_hat_window() {
+    # ensure_hat_window <hat> -> prints window id, and focuses it
+    local hat="$1" w
+    w=$(find_hat_window "$hat")
+
+    if [[ -z "$w" ]]; then
+        local before after
+        before=$(window_ids)
+        info "Opening a new cmux window for hat '$hat'" >&2
+        cmux new-window >/dev/null
+        sleep 0.6
+        after=$(window_ids)
+        w=$(comm -13 <(sort <<<"$before") <(sort <<<"$after") | head -1)
+        [[ -n "$w" ]] || die "could not determine the new window's id"
+
+        # Do not record the placeholder's id here - a brand-new window has not
+        # necessarily titled it yet. Just note that we opened this window.
+        NEW_WINDOW_STRAY="$w"
+    fi
+
+    cmux focus-window --window "$w" >/dev/null 2>&1 || true
+    printf '%s' "$w"
+}
+
+ensure_cmux_group() {
+    # ensure_cmux_group <name> <window> -> prints group ref
+    local name="$1" win="$2" ref
+    ref=$(group_ref_in_window "$win" "$name")
+    if [[ -z "$ref" ]]; then
+        info "Creating workspace group '$name'" >&2
+        cmux focus-window --window "$win" >/dev/null 2>&1 || true
+        cmux workspace-group create --name "$name" >/dev/null
+        sleep 0.4
+        ref=$(group_ref_in_window "$win" "$name")
+    fi
+    [[ -n "$ref" ]] || die "could not create or find workspace group: $name"
+    printf '%s' "$ref"
+}
+
+mirror_hat() {
+    # mirror_hat <hat> <window> - mirrors into the (focused) target window
+    local hat="$1" win="$2" host
+    host=$(hat_ssh "$hat")
+    cmux focus-window --window "$win" >/dev/null 2>&1 || true
+    info "Mirroring $host into the '$hat' window"
+    cmux ssh-tmux "$host" --no-focus >/dev/null
+}
+
+wait_for_workspace() {
+    # wait_for_workspace <title> <window> [tries] -> prints ref
+    local title="$1" win="$2" tries="${3:-40}" ref="" i
+    for ((i = 0; i < tries; i++)); do
+        ref=$(workspace_ref_by_title "$title" "$win")
+        [[ -n "$ref" ]] && break
+        # the mirror may have landed in another window; pull it over
+        ref=$(workspace_ref_by_title "$title")
+        if [[ -n "$ref" ]]; then
+            cmux move-workspace-to-window --workspace "$ref" --window "$win" >/dev/null 2>&1 || true
+            sleep 0.3
+            ref=$(workspace_ref_by_title "$title" "$win")
+            [[ -n "$ref" ]] && break
+        fi
+        sleep 0.25
+    done
+    printf '%s' "$ref"
+}
+
+discard_stray_workspace() {
+    # Close the untouched "~" placeholder a freshly opened window came with, now
+    # that the window has something real in it. Only ever runs for a window this
+    # script opened, and only while more than one workspace is present.
+    local win="$1" count id
+    [[ "$NEW_WINDOW_STRAY" == "$win" ]] || return 0
+    count=$(cmux_json workspace list --window "$win" 2>/dev/null | jq '.workspaces | length')
+    if [[ "${count:-0}" -gt 1 ]]; then
+        while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            cmux close-workspace --workspace "$id" >/dev/null 2>&1 || true
+        done < <(cmux_json workspace list --window "$win" 2>/dev/null \
+                 | jq -r '.workspaces[]? | select(.title == "~") | .id')
+    fi
+    NEW_WINDOW_STRAY=""
+}
+
+apply_group_style() {
+    local group="$1" ref="$2" color icon pinned collapsed
+    color=$(cfg --arg g "$group" '.groups[$g].color // empty')
+    icon=$(cfg --arg g "$group" '.groups[$g].icon // empty')
+    pinned=$(cfg --arg g "$group" '.groups[$g].pinned // false')
+    collapsed=$(cfg --arg g "$group" '.groups[$g].collapsed // false')
+
+    [[ -n "$color" && "$color" != "null" ]] && \
+        cmux workspace-group set-color "$ref" --hex "$color" >/dev/null 2>&1 || true
+    [[ -n "$icon" && "$icon" != "null" ]] && \
+        cmux workspace-group set-icon "$ref" --symbol "$icon" >/dev/null 2>&1 || true
+    [[ "$pinned" == "true" ]] && cmux workspace-group pin "$ref" >/dev/null 2>&1 || true
+    [[ "$collapsed" == "true" ]] && cmux workspace-group collapse "$ref" >/dev/null 2>&1 || true
+    return 0
+}
+
+# ------------------------------------------------------------ provisioning
+
+provision_host() {
+    local host="$1"
+    info "Provisioning tmux persistence on $host"
+    remote_sh_stdin "$host" bash -s <<'REMOTE_EOF'
+set -euo pipefail
+
+CONF="$HOME/.tmux.conf"
+touch "$CONF"
+
+if [ ! -d "$HOME/.tmux/plugins/tpm" ]; then
+    echo "installing tpm"
+    git clone -q https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm"
+else
+    echo "tpm already installed"
+fi
+
+# Replace any previous managed block rather than skipping it, so re-provisioning
+# actually rolls out changes.
+# Strip any previous managed block, including ones written under the old
+# new-agent name, rather than skipping - re-provisioning must roll out changes.
+if grep -qE '^# >>> (hatter|muxmux|new-agent) managed' "$CONF"; then
+    echo "refreshing managed block in $CONF"
+    awk '
+        /^# >>> (hatter|muxmux|new-agent) managed/ { skip = 1 }
+        !skip                               { print }
+        /^# <<< (hatter|muxmux|new-agent) managed/ { skip = 0 }
+    ' "$CONF" > "$CONF.new"
+    mv "$CONF.new" "$CONF"
+else
+    echo "adding managed block to $CONF"
+fi
+
+cat >> "$CONF" <<'BLOCK'
+
+# >>> hatter managed >>>
+# Session state survives a reboot of this shell server: continuum autosaves
+# every 15 minutes and restores on tmux server start.
+set -g @plugin 'tmux-plugins/tpm'
+set -g @plugin 'tmux-plugins/tmux-resurrect'
+set -g @plugin 'tmux-plugins/tmux-continuum'
+set -g @resurrect-capture-pane-contents 'on'
+set -g @resurrect-strategy-nvim 'session'
+set -g @continuum-restore 'on'
+set -g @continuum-save-interval '15'
+
+# Logging out must not destroy a tab by accident. Every pane runs its login
+# shell inside a loop, so `exit` and stray ctrl-D just hand back a fresh prompt.
+#
+# There are two deliberate ways out, both server-side:
+#   `bye`      kills the pane (see ~/.local/bin/bye)
+#   `exit 99`  the sentinel status the loop breaks on
+#
+# 99 rather than 1 on purpose: bare `exit` returns the *last command's* status,
+# so a sentinel of 1 would close the tab every time you typed `exit` after a
+# failed command. 99 is effectively never returned by accident.
+#
+# This replaced `remain-on-exit on` + a `pane-died` respawn hook, which raced
+# with tmux's own pane teardown and only fired about two times in three.
+set -g default-command 'while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
+set -g remain-on-exit off
+set-hook -gu pane-died
+
+# Keep `run tpm` last.
+run '~/.tmux/plugins/tpm/tpm'
+# <<< hatter managed <<<
+BLOCK
+
+# The deliberate way to close a tab from the server side. Panes never die on
+# their own now, so something has to be able to end one on purpose.
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/bye" <<'BYE'
+#!/bin/sh
+# bye - close this tab, pane, or session for real.
+#
+# Panes run their login shell in a loop so `exit` and ctrl-D hand back a fresh
+# prompt instead of destroying the tab. This is the way out on purpose.
+#
+#   bye            close this pane (and the tab, if it was the only pane)
+#   bye window     close the whole tmux window
+#   bye session    close the whole session, and with it the cmux workspace
+#
+# Equivalent without this script: `exit 99`.
+set -u
+case "${1:-pane}" in
+    -h|--help)
+        sed -n '3,11p' "$0" | sed 's/^#\{1,\} \{0,1\}//'
+        exit 0
+        ;;
+esac
+if [ -z "${TMUX:-}" ]; then
+    echo "bye: not inside tmux - plain 'exit' already works here" >&2
+    exit 1
+fi
+case "${1:-pane}" in
+    pane)       exec tmux kill-pane ;;
+    window|tab) exec tmux kill-window ;;
+    session)    exec tmux kill-session ;;
+    *) echo "bye: unknown target '$1' (pane|window|session)" >&2; exit 2 ;;
+esac
+BYE
+chmod +x "$HOME/.local/bin/bye"
+
+# Receives Claude Code logins pushed from the client. The client is the only
+# place a login is ever entered; this just installs what it is handed.
+cat > "$HOME/.local/bin/hat-creds" <<'HATCREDS'
+#!/usr/bin/env python3
+"""hat-creds - receive Claude Code credentials pushed from the hatter client.
+
+The client holds every login (in the macOS Keychain, via cswap) and pushes one
+here over ssh; nothing is ever stored on this server that the client did not
+put here on purpose.
+
+    hat-creds install     read a `cswap export` envelope on stdin, install it
+    hat-creds status      print what is installed now, as JSON
+    hat-creds clear       remove the installed credential
+
+Claude Code reads the credential when a session starts, so an already-running
+session keeps the account it started with. New sessions pick up the new one.
+"""
+import json
+import os
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CRED = os.path.join(HOME, ".claude", ".credentials.json")
+CONF = os.path.join(HOME, ".claude.json")
+
+
+def die(msg):
+    sys.stderr.write("hat-creds: %s\n" % msg)
+    raise SystemExit(1)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def write_private(path, text):
+    """Write 0600 from creation - never expose a token at the umask default."""
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, 0o700)
+    tmp = path + ".hat-creds.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def install():
+    try:
+        envelope = json.load(sys.stdin)
+    except ValueError as e:
+        die("stdin is not a valid cswap export: %s" % e)
+    if not isinstance(envelope, dict):
+        die("export envelope must be a JSON object")
+    if envelope.get("version") != 1:
+        die("unsupported export version: %r" % envelope.get("version"))
+    if envelope.get("encrypted") is True:
+        die("encrypted exports are not supported - decrypt before piping")
+    accounts = envelope.get("accounts")
+    if not isinstance(accounts, list) or len(accounts) != 1:
+        die("expected exactly one account in the export, got %s"
+            % (len(accounts) if isinstance(accounts, list) else "none"))
+
+    acct = accounts[0]
+    email = acct.get("email") or "(unknown)"
+    creds = acct.get("credentials")
+
+    if isinstance(creds, str):
+        # An API-key account: the credential is the raw sk-ant-api… string.
+        write_private(CRED, creds.strip() + "\n")
+        kind = "api_key"
+    elif isinstance(creds, dict):
+        # Merge rather than replace: mcpOAuth and trustedDeviceToken belong to
+        # THIS machine (MCP server logins, device trust) and are not in the
+        # export. Overwriting the file wholesale would silently log the server
+        # out of every MCP server it had authorised.
+        existing = read_json(CRED)
+        merged = existing if isinstance(existing, dict) else {}
+        merged.update(creds)
+        write_private(CRED, json.dumps(merged, indent=2) + "\n")
+        kind = "oauth"
+    else:
+        die("credentials for %s are neither an object nor an API key" % email)
+
+    # ~/.claude.json carries the account identity Claude Code displays. Merge
+    # oauthAccount in and leave the rest of the file (projects, history,
+    # onboarding state) exactly as it was.
+    oauth_account = (acct.get("config") or {}).get("oauthAccount")
+    if isinstance(oauth_account, dict):
+        conf = read_json(CONF)
+        if not isinstance(conf, dict):
+            conf = {}
+        conf["oauthAccount"] = oauth_account
+        write_private(CONF, json.dumps(conf, indent=2) + "\n")
+
+    print("installed %s (%s) as %s" % (email, kind, CRED))
+
+
+def status():
+    out = {"host": os.uname().nodename, "user": os.environ.get("USER", ""),
+           "kind": "none", "email": None, "organizationName": None,
+           "expiresAt": None, "expiresInSeconds": None, "expired": None,
+           "hasRefreshToken": None}
+    raw = read_text(CRED)
+    if raw is None:
+        print(json.dumps(out))
+        return
+    stripped = raw.strip()
+    if stripped.startswith("sk-ant-api"):
+        out["kind"] = "api_key"
+    else:
+        try:
+            obj = json.loads(stripped)
+        except ValueError:
+            out["kind"] = "unreadable"
+            print(json.dumps(out))
+            return
+        oauth = obj.get("claudeAiOauth")
+        if isinstance(oauth, dict):
+            out["kind"] = "oauth"
+            # An expired access token is routine: Claude Code trades the
+            # refresh token for a new one on its own. Only a credential with
+            # no refresh token actually needs pushing again.
+            out["hasRefreshToken"] = bool(oauth.get("refreshToken"))
+            exp = oauth.get("expiresAt")
+            if isinstance(exp, (int, float)):
+                # Claude Code stores expiry in milliseconds.
+                out["expiresAt"] = exp
+                out["expiresInSeconds"] = int(exp / 1000.0 - time.time())
+                out["expired"] = out["expiresInSeconds"] <= 0
+        else:
+            out["kind"] = "unknown"
+
+    conf = read_json(CONF) or {}
+    acct = conf.get("oauthAccount")
+    if isinstance(acct, dict):
+        out["email"] = acct.get("emailAddress")
+        out["organizationName"] = acct.get("organizationName")
+    print(json.dumps(out))
+
+
+def clear():
+    removed = []
+    for path in (CRED,):
+        try:
+            os.unlink(path)
+            removed.append(path)
+        except OSError:
+            pass
+    conf = read_json(CONF)
+    if isinstance(conf, dict) and "oauthAccount" in conf:
+        del conf["oauthAccount"]
+        write_private(CONF, json.dumps(conf, indent=2) + "\n")
+        removed.append("%s:oauthAccount" % CONF)
+    print("cleared: %s" % (", ".join(removed) if removed else "nothing to clear"))
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__)
+        return
+    if cmd == "install":
+        install()
+    elif cmd == "status":
+        status()
+    elif cmd == "clear":
+        clear()
+    else:
+        die("unknown command %r (install|status|clear)" % cmd)
+
+
+if __name__ == "__main__":
+    main()
+HATCREDS
+chmod +x "$HOME/.local/bin/hat-creds"
+
+# ~/.local/bin is only on PATH for a login shell if the shell's profile adds it.
+# Ubuntu's ~/.profile does, but only when the directory already existed at login,
+# and zsh never reads ~/.profile at all. Make it deterministic.
+ensure_path_in() {
+    f="$1"
+    [ -e "$f" ] || touch "$f"
+    # An earlier release wrote this block under the old name; relabel it in
+    # place rather than appending a second, identical one.
+    if grep -qF 'muxmux: ~/.local/bin on PATH' "$f" 2>/dev/null; then
+        sed 's/^# muxmux: ~\/.local\/bin on PATH/# hatter: ~\/.local\/bin on PATH/' \
+            "$f" > "$f.hatter.tmp" && mv "$f.hatter.tmp" "$f"
+        echo "relabelled the PATH block in $f"
+    fi
+    grep -qF 'hatter: ~/.local/bin on PATH' "$f" 2>/dev/null && return 0
+    cat >> "$f" <<'PATHBLOCK'
+
+# hatter: ~/.local/bin on PATH (for `bye`)
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
+export PATH
+PATHBLOCK
+    echo "added ~/.local/bin to PATH in $f"
+}
+
+case "$(basename "${SHELL:-/bin/sh}")" in
+    zsh)  ensure_path_in "$HOME/.zprofile" ;;
+    bash) ensure_path_in "$HOME/.profile" ;;
+    *)    ensure_path_in "$HOME/.profile" ;;
+esac
+
+# tpm reads the @plugin options off the running tmux server, so the config has
+# to be sourced before install_plugins can see what to fetch.
+tmux source-file "$CONF" >/dev/null 2>&1 || true
+"$HOME/.tmux/plugins/tpm/bin/install_plugins" || true
+tmux source-file "$CONF" >/dev/null 2>&1 || true
+
+for p in tmux-resurrect tmux-continuum; do
+    if [ -d "$HOME/.tmux/plugins/$p" ]; then
+        echo "ok: $p"
+    else
+        echo "WARNING: $p did not install" >&2
+    fi
+done
+
+# Apply to the already-running server too, not just future ones. A long-lived
+# server can hold a pane-died hook that reads as set but never fires, so clear
+# it before setting it rather than assuming the value is live.
+if tmux has-session 2>/dev/null; then
+    tmux set -g default-command 'while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
+    tmux set -g remain-on-exit off
+    tmux set-hook -gu pane-died 2>/dev/null || true
+    echo "applied to the running tmux server"
+fi
+
+# Prove it actually works rather than trusting show-options: a shell that exits
+# must come back with a usable prompt, in a throwaway session.
+tmux kill-session -t '=hatter-selftest' 2>/dev/null || true
+tmux new-session -d -s hatter-selftest -x 80 -y 24
+sleep 1
+tmux send-keys -t '=hatter-selftest:0' 'exit' Enter
+sleep 2
+if ! tmux has-session -t '=hatter-selftest' 2>/dev/null; then
+    echo "SELFTEST FAILED: session died when its shell exited" >&2
+else
+    tmux send-keys -t '=hatter-selftest:0' 'echo selftest-ok-$((6*7))' Enter
+    sleep 1
+    if tmux capture-pane -p -t '=hatter-selftest:0' | grep -q 'selftest-ok-42'; then
+        echo "selftest ok: exiting a shell hands back a working prompt"
+    else
+        echo "SELFTEST FAILED: shell did not come back usable after exit" >&2
+    fi
+fi
+tmux kill-session -t '=hatter-selftest' 2>/dev/null || true
+
+# ...and that the deliberate exits really do close it.
+tmux kill-session -t '=hatter-selftest2' 2>/dev/null || true
+tmux new-session -d -s hatter-selftest2 -x 80 -y 24
+sleep 1
+tmux send-keys -t '=hatter-selftest2:0' 'exit 99' Enter
+sleep 2
+if tmux has-session -t '=hatter-selftest2' 2>/dev/null; then
+    echo "SELFTEST FAILED: 'exit 99' did not close the session" >&2
+    tmux kill-session -t '=hatter-selftest2' 2>/dev/null || true
+else
+    echo "selftest ok: 'exit 99' closes the tab"
+fi
+
+# `bye` has to be reachable from a *login* shell, which is what panes run.
+if "${SHELL:-/bin/sh}" -lc 'command -v bye' >/dev/null 2>&1; then
+    echo "selftest ok: 'bye' is on PATH for a login shell"
+else
+    echo "SELFTEST FAILED: 'bye' is not on PATH for a login shell" >&2
+fi
+
+# hat-creds only has to run; it is driven over ssh with an explicit path.
+if python3 "$HOME/.local/bin/hat-creds" status >/dev/null 2>&1; then
+    echo "selftest ok: 'hat-creds' runs (credential push is available)"
+else
+    echo "SELFTEST FAILED: 'hat-creds' did not run - is python3 installed?" >&2
+fi
+
+echo "provisioned: $(tmux -V)"
+REMOTE_EOF
+}
+
+# -------------------------------------------------------------- subcommands
+
+cmd_new() {
+    local session="${1:-}" group="" hat="" ssh_dest="" dir=""
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --group) group="$2"; shift 2 ;;
+            --hat) hat="$2"; shift 2 ;;
+            --ssh|--host) ssh_dest="$2"; shift 2 ;;
+            --dir) dir="$2"; shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    [[ -n "$session" ]] || usage_exit
+
+    # Work out the hat, most specific source first: an explicit --hat, then an
+    # existing record for this session, then the group it is going into, then
+    # the session name's own prefix.
+    if [[ -n "$hat" ]]; then
+        hat_exists "$hat" || register_hat "$hat" "$ssh_dest" "$dir"
+    else
+        hat=$(session_hat "$session") || true
+    fi
+
+    if [[ -z "$hat" && -n "$group" ]] && group_exists "$group"; then
+        hat=$(group_hat "$group")
+    fi
+
+    if [[ -z "$hat" ]]; then
+        hat="${session%%-*}"
+        if [[ "$hat" == "$session" ]]; then
+            die "cannot tell which hat '$session' belongs to.
+  Either name it <hat>-<subproject>, or pass --hat <hat>.
+  Known hats: $(hat_names | tr '\n' ' ')"
+        fi
+        hat_exists "$hat" || register_hat "$hat" "$ssh_dest" "$dir"
+    elif [[ -n "$ssh_dest" ]]; then
+        register_hat "$hat" "$ssh_dest" "$dir"
+    fi
+
+    # Now that the hat is known, a bare name can take its prefix.
+    [[ "$session" == "$hat"-* ]] || session="${hat}-${session}"
+
+    # Work out the group.
+    if [[ -z "$group" ]]; then
+        group=$(session_group "$session") || true
+    fi
+    if [[ -z "$group" ]]; then
+        group=$(hat_default_group "$hat")
+    fi
+    if [[ -z "$group" ]]; then
+        group=$(groups_of_hat "$hat" | head -1)
+    fi
+    if [[ -z "$group" ]]; then
+        [[ -t 0 ]] || die "no group for '$session' and no --group given"
+        read -r -p "  workspace group for $session: " group
+        [[ -n "$group" ]] || die "no group given"
+    fi
+    group_exists "$group" || register_group "$group" "$hat"
+
+    local host d
+    host=$(hat_ssh "$hat"); d=$(hat_dir "$hat")
+    [[ -n "$host" ]] || die "hat '$hat' has no ssh destination"
+
+    ensure_remote_session "$host" "$session" "$d"
+    remember_session "$group" "$session"
+
+    local win gref wref
+    win=$(ensure_hat_window "$hat")
+    gref=$(ensure_cmux_group "$group" "$win")
+    mirror_hat "$hat" "$win"
+
+    wref=$(wait_for_workspace "$session" "$win")
+    [[ -n "$wref" ]] || die "tmux session '$session' exists on $host but no cmux workspace appeared"
+
+    cmux workspace-group add --group "$gref" --workspace "$wref" >/dev/null
+    apply_group_style "$group" "$gref"
+    discard_stray_workspace "$win"
+    cmux workspace select --workspace "$wref" >/dev/null 2>&1 || \
+        cmux select-workspace --workspace "$wref" >/dev/null
+
+    echo
+    echo "  Hat:        $hat  ($host)"
+    echo "  Window:     $win"
+    echo "  Group:      $group"
+    echo "  tmux:       $session"
+    echo "  Workspace:  $wref"
+}
+
+hat_status_row() {
+    local hat="$1" dest probe err reach tmuxv resurrect sessions win
+    dest=$(hat_ssh "$hat")
+
+    err=$(mktemp)
+    if probe=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$dest" '
+        printf "%s|" "$(tmux -V 2>/dev/null | awk "{print \$2}")"
+        if [ -d "$HOME/.tmux/plugins/tmux-resurrect" ] \
+           && [ -d "$HOME/.tmux/plugins/tmux-continuum" ]; then
+            printf "yes|"
+        else
+            printf "no|"
+        fi
+        printf "%s" "$(tmux list-sessions 2>/dev/null | wc -l | tr -d " ")"
+    ' 2>"$err"); then
+        reach="up"
+        IFS='|' read -r tmuxv resurrect sessions <<<"$probe"
+        [[ -n "$tmuxv" ]] || { tmuxv="-"; resurrect="-"; }
+    else
+        # say *why* it is down - "no DNS" on a server you have not built yet is
+        # a very different problem from "auth"
+        case "$(cat "$err")" in
+            *"Could not resolve hostname"*) reach="no DNS" ;;
+            *"Connection refused"*)         reach="refused" ;;
+            *"Permission denied"*)          reach="auth" ;;
+            *"timed out"*|*"Timeout"*)      reach="timeout" ;;
+            *"Host key verification"*)      reach="hostkey" ;;
+            *)                              reach="down" ;;
+        esac
+        tmuxv="-"; resurrect="-"; sessions="-"
+    fi
+    rm -f "$err"
+
+    win=$(find_hat_window "$hat")
+    [[ -n "$win" ]] && win="${win:0:8}" || win="-"
+
+    printf '%-10s  %-24s  %-8s  %-5s  %-8s  %-4s  %s\n' \
+        "$hat" "$dest" "$reach" "${tmuxv:--}" "${resurrect:--}" "${sessions:--}" "$win"
+}
+
+cmd_tab() {
+    # Add a tab back to a workspace: in the mirror a tab IS a tmux window, so
+    # creating one on the server makes it appear - no re-mirror needed.
+    local session="${1:-}" name="${2:-}" dir=""
+    [[ -n "$session" ]] || die "usage: hatter tab <session> [tab-name]"
+
+    # A hat is not a workspace. Catch the confusion explicitly rather than
+    # failing later with advice that cannot help.
+    if hat_exists "$session"; then
+        local listing
+        listing=$(cfg --arg l "$session" '
+            .groups | to_entries[] | select(.value.hat == $l)
+            | .key as $g | .value.sessions | keys[]? | "  \($g) / \(.)"')
+        die "'$session' is a hat, not a workspace - tabs live inside workspaces.
+${listing:+
+Workspaces under the '$session' hat:
+$listing
+}
+  hatter tab <workspace> [tab-name]"
+    fi
+
+    local group hat host
+    group=$(session_group "$session")
+    if [[ -n "$group" ]]; then
+        hat=$(group_hat "$group")
+    else
+        hat=$(session_hat "$session")
+    fi
+
+    if [[ -z "$hat" ]]; then
+        die "no workspace named '$session', and its name has no hat prefix.
+  See what exists with:  hatter list
+  Known hats: $(hat_names | tr '\n' ' ')"
+    fi
+
+    host=$(hat_ssh "$hat")
+    dir=$(hat_dir "$hat")
+
+    if ! remote_session_exists "$host" "$session"; then
+        if [[ -n "$group" ]]; then
+            # recorded in the config, so restore genuinely is the right fix
+            die "workspace '$session' is recorded but not running on $host.
+  hatter restore $hat"
+        fi
+        die "no workspace '$session' on $host (hat: $hat).
+  Create it with:  hatter $session
+  Or list what exists:  hatter list"
+    fi
+
+    local nameopt=""
+    [[ -n "$name" ]] && nameopt="-n $(sq "$name")"
+    remote_sh "$host" "tmux new-window -t $(sq "=$session") $nameopt -c $(sq "$dir")"
+    info "Added a tab to '$session' on $host${name:+ (named '$name')}"
+}
+
+cmd_rename() {
+    # Rename a session everywhere at once: on the server, in cmux, in the config.
+    local old="${1:-}" new="${2:-}"
+    [[ -n "$old" && -n "$new" ]] || die "usage: hatter rename <old-session> <new-session>"
+
+    local group hat host
+    group=$(session_group "$old")
+    [[ -n "$group" ]] || die "no recorded session named '$old' (see: hatter list)"
+    hat=$(group_hat "$group")
+    host=$(hat_ssh "$hat")
+
+    if remote_session_exists "$host" "$new"; then
+        die "a tmux session named '$new' already exists on $host"
+    fi
+
+    if remote_session_exists "$host" "$old"; then
+        info "tmux rename-session '$old' -> '$new' on $host"
+        remote_sh "$host" "tmux rename-session -t $(sq "=$old") $(sq "$new")"
+    else
+        warn "'$old' is not running on $host; renaming the config entry only"
+    fi
+
+    backup_config
+    jq_write --arg g "$group" --arg o "$old" --arg n "$new" '
+        .groups[$g].sessions[$n] = .groups[$g].sessions[$o]
+        | del(.groups[$g].sessions[$o])
+    '
+
+    # The mirror follows the tmux rename, but nudge the workspace title in case
+    # this hat is not currently mirrored.
+    local wref
+    wref=$(workspace_ref_by_title "$new")
+    [[ -z "$wref" ]] && wref=$(workspace_ref_by_title "$old")
+    if [[ -n "$wref" ]]; then
+        cmux rename-workspace --workspace "$wref" "$new" >/dev/null 2>&1 || true
+    fi
+
+    info "Renamed '$old' -> '$new' (hat: $hat, group: $group)"
+}
+
+cmd_backup() {
+    # sync, then commit and push the config as a plain git repo. Deliberately
+    # nothing product-specific: any git remote reachable over ssh will do.
+    local msg="${1:-}"
+
+    command -v git >/dev/null 2>&1 || die "git is not installed"
+    if [[ ! -d "$CONFIG_DIR/.git" ]]; then
+        die "$CONFIG_DIR is not a git repo.
+  Set one up with:
+    cd $CONFIG_DIR && git init -b main
+    git remote add origin <user@host>:git/dotfiles.git"
+    fi
+
+    cmd_sync
+
+    # The config alone is only half the state - it is useless without the tool
+    # that reads it. Keeping a copy of the script in the same repo means one
+    # clone restores both after a Mac rebuild.
+    mkdir -p "$CONFIG_DIR/bin"
+    local self
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    if ! cmp -s "$self" "$CONFIG_DIR/bin/$(basename "$self")"; then
+        cp "$self" "$CONFIG_DIR/bin/$(basename "$self")"
+        chmod +x "$CONFIG_DIR/bin/$(basename "$self")"
+    fi
+
+    # --porcelain covers untracked files too; diff --quiet alone would miss a
+    # brand-new bin/hatter and quietly skip the commit.
+    if [[ -z "$(git -C "$CONFIG_DIR" status --porcelain)" ]]; then
+        info "No config changes to back up"
+    else
+        [[ -n "$msg" ]] || msg="hatter config $(date '+%Y-%m-%d %H:%M')"
+        git -C "$CONFIG_DIR" add -A
+        git -C "$CONFIG_DIR" -c commit.gpgsign=false commit -q -m "$msg"
+        info "Committed: $msg"
+    fi
+
+    if git -C "$CONFIG_DIR" remote get-url origin >/dev/null 2>&1; then
+        if git -C "$CONFIG_DIR" push -q origin HEAD 2>&1; then
+            info "Pushed to $(git -C "$CONFIG_DIR" remote get-url origin)"
+        else
+            warn "push failed - the remote may be unreachable; the commit is safe locally"
+        fi
+    else
+        warn "no 'origin' remote set; committed locally only"
+    fi
+}
+
+cmd_hat() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        list|"")
+            cfg '.hats | to_entries[]
+                 | "\(.key)\t-> \(.value.ssh)  [\(.value.remote_dir)]"
+                   + (if .value.default_group then "  default group: \(.value.default_group)" else "" end)'
+            ;;
+        add|set)
+            local name="${1:-}" ssh_dest="" dir="" defgroup=""
+            shift || true
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --ssh|--host) ssh_dest="$2"; shift 2 ;;
+                    --dir) dir="$2"; shift 2 ;;
+                    --group) defgroup="$2"; shift 2 ;;
+                    *) die "unknown flag: $1" ;;
+                esac
+            done
+            [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>]"
+            register_hat "$name" "$ssh_dest" "$dir" "$defgroup"
+            if [[ -n "$defgroup" ]]; then
+                group_exists "$defgroup" || register_group "$defgroup" "$name"
+            fi
+            ;;
+        status)
+            printf '%-10s  %-24s  %-8s  %-5s  %-8s  %-4s  %s\n' \
+                HAT DESTINATION STATUS TMUX RESURRECT SESS WINDOW
+            local hat
+            while IFS= read -r hat; do
+                [[ -z "$hat" ]] && continue
+                hat_status_row "$hat"
+            done < <(hat_names)
+            ;;
+        rename|mv)
+            local old="${1:-}" new="${2:-}"
+            [[ -n "$old" && -n "$new" ]] || die "usage: hatter hat rename <old> <new>"
+            hat_exists "$old" || die "unknown hat: $old"
+            hat_exists "$new" && die "hat '$new' already exists"
+
+            local host
+            host=$(hat_ssh "$old")
+
+            # The prefix is load-bearing, so any session carrying the old one has
+            # to be renamed on the server too. That renames the cmux workspace.
+            local session
+            while IFS= read -r session; do
+                [[ -z "$session" ]] && continue
+                [[ "$session" == "$old"-* ]] || continue
+                local renamed="${new}-${session#"$old"-}"
+                if remote_session_exists "$host" "$session"; then
+                    info "tmux rename-session '$session' -> '$renamed'"
+                    remote_sh "$host" \
+                        "tmux rename-session -t $(sq "=$session") $(sq "$renamed")"
+                fi
+                jq_write --arg o "$session" --arg n "$renamed" '
+                    .groups |= map_values(
+                        if .sessions[$o]
+                        then .sessions[$n] = .sessions[$o] | del(.sessions[$o])
+                        else . end)
+                '
+            done < <(cfg --arg l "$old" '
+                .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys[]?')
+
+            backup_config
+            jq_write --arg o "$old" --arg n "$new" '
+                .hats[$n] = .hats[$o]
+                | del(.hats[$o])
+                | .groups |= map_values(if .hat == $o then .hat = $n else . end)
+            '
+            info "Renamed hat '$old' -> '$new'"
+            ;;
+        rm|remove)
+            local name="${1:-}"
+            [[ -n "$name" ]] || die "usage: hatter hat rm <prefix>"
+            backup_config
+            jq_write --arg l "$name" 'del(.hats[$l])'
+            info "Removed hat '$name' from config"
+            ;;
+        *) die "unknown hat subcommand: $sub" ;;
+    esac
+}
+
+cmd_group() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        list|"")
+            cfg '.groups | to_entries[]
+                 | "\(.key)\t[hat: \(.value.hat)]  \(.value.sessions | keys | join(", "))"'
+            ;;
+        add|set)
+            local name="${1:-}" hat=""
+            shift || true
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --hat|--login|--prefix) hat="$2"; shift 2 ;;
+                    *) die "unknown flag: $1" ;;
+                esac
+            done
+            [[ -n "$name" ]] || die "usage: hatter group add <Name> --hat <prefix>"
+            if [[ -z "$hat" ]]; then
+                [[ -t 0 ]] || die "--hat is required"
+                read -r -p "  hat prefix for '$name': " hat
+            fi
+            hat_exists "$hat" || register_hat "$hat" "" ""
+            register_group "$name" "$hat"
+            local win gref
+            win=$(ensure_hat_window "$hat")
+            gref=$(ensure_cmux_group "$name" "$win")
+            apply_group_style "$name" "$gref"
+            info "Group '$name' ready in window $win ($gref)"
+            ;;
+        rename|mv)
+            local old_name="${1:-}" new_name="${2:-}"
+            [[ -n "$old_name" && -n "$new_name" ]] || \
+                die "usage: hatter group rename <old> <new>"
+            group_exists "$old_name" || die "unknown group: $old_name"
+            group_exists "$new_name" && die "a group named '$new_name' already exists"
+
+            local hat win gref
+            hat=$(group_hat "$old_name")
+            win=$(find_hat_window "$hat")
+            if [[ -n "$win" ]]; then
+                gref=$(group_ref_in_window "$win" "$old_name")
+                [[ -n "$gref" ]] && \
+                    cmux workspace-group rename "$gref" --name "$new_name" >/dev/null 2>&1 || true
+            fi
+
+            backup_config
+            jq_write --arg o "$old_name" --arg n "$new_name" '
+                .groups[$n] = .groups[$o]
+                | del(.groups[$o])
+                | .hats |= map_values(
+                    if .default_group == $o then .default_group = $n else . end)
+            '
+            info "Renamed group '$old_name' -> '$new_name'"
+            ;;
+        rm|remove)
+            local name="${1:-}"
+            [[ -n "$name" ]] || die "usage: hatter group rm <Name>"
+            backup_config
+            jq_write --arg g "$name" 'del(.groups[$g])'
+            info "Removed '$name' from config (cmux group left untouched)"
+            ;;
+        *) die "unknown group subcommand: $sub" ;;
+    esac
+}
+
+cmd_sync() {
+    backup_config
+
+    # Iterate hats, not windows. A group belongs to exactly one hat and so lives
+    # in exactly one window; scanning every window would let a same-named group
+    # in some other window overwrite the real one.
+    local hat
+    while IFS= read -r hat; do
+        [[ -z "$hat" ]] && continue
+
+        local w
+        w=$(find_hat_window "$hat")
+        if [[ -z "$w" ]]; then
+            echo "  $hat: no window open, leaving its config untouched"
+            continue
+        fi
+
+        local host live=""
+        host=$(hat_ssh "$hat")
+        [[ -n "$host" ]] && live=$(remote_sessions "$host" 2>/dev/null || true)
+        if [[ -z "$live" ]]; then
+            echo "  $hat: $host unreachable or idle, leaving its config untouched"
+            continue
+        fi
+
+        local groups_json ws_json gname
+        groups_json=$(cmux_json workspace-group list --window "$w" 2>/dev/null || echo '{"groups":[]}')
+        ws_json=$(cmux_json workspace list --window "$w" 2>/dev/null || echo '{"workspaces":[]}')
+
+        while IFS= read -r gname; do
+            [[ -z "$gname" ]] && continue
+
+            if group_exists "$gname"; then
+                # a group of the same name owned by a different hat is a name
+                # clash, not this hat's group - leave it alone
+                local owner
+                owner=$(group_hat "$gname")
+                [[ -n "$owner" && "$owner" != "$hat" ]] && {
+                    warn "group '$gname' is in $hat's window but config says hat '$owner'; skipping"
+                    continue
+                }
+            else
+                info "Adopting group '$gname' under hat '$hat'"
+                register_group "$gname" "$hat"
+            fi
+
+            local color icon pinned collapsed
+            color=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .custom_color // ""' <<<"$groups_json")
+            icon=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .icon_symbol // ""' <<<"$groups_json")
+            pinned=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .is_pinned // false' <<<"$groups_json")
+            collapsed=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .is_collapsed // false' <<<"$groups_json")
+
+            jq_write --arg g "$gname" --arg c "$color" --arg i "$icon" \
+                     --argjson p "${pinned:-false}" --argjson co "${collapsed:-false}" '
+                .groups[$g].color     = (if $c == "" then null else $c end)
+                | .groups[$g].icon    = (if $i == "" then null else $i end)
+                | .groups[$g].pinned  = $p
+                | .groups[$g].collapsed = $co
+            '
+
+            local fresh='{}' wref title windows
+            while IFS= read -r wref; do
+                [[ -z "$wref" ]] && continue
+                title=$(jq -r --arg r "$wref" '.workspaces[] | select(.id==$r) | .title' <<<"$ws_json")
+                [[ -z "$title" || "$title" == "null" ]] && continue
+                grep -qxF "$title" <<<"$live" || continue
+
+                windows=$(remote_windows_json "$host" "$title")
+                fresh=$(jq --arg s "$title" --argjson wj "$windows" '.[$s] = {windows: $wj}' <<<"$fresh")
+                echo "  $hat / $gname / $title  ($(jq 'length' <<<"$windows") tabs)"
+            done < <(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .member_workspace_ids[]?' <<<"$groups_json")
+
+            jq_write --arg g "$gname" --argjson s "$fresh" '.groups[$g].sessions = $s'
+        done < <(jq -r '.groups[]?.name' <<<"$groups_json")
+    done < <(hat_names)
+
+    info "Config synced: $CONFIG"
+}
+
+cmd_restore() {
+    local hats
+    if [[ $# -gt 0 ]]; then
+        local tok resolved=() l
+        for tok in "$@"; do
+            if hat_exists "$tok"; then
+                resolved+=("$tok")
+            elif group_exists "$tok"; then
+                resolved+=("$(group_hat "$tok")")
+            else
+                warn "unknown hat or group: $tok"
+            fi
+        done
+        [[ ${#resolved[@]} -gt 0 ]] || die "nothing to restore"
+        hats=$(printf '%s\n' "${resolved[@]}" | sort -u)
+    else
+        hats=$(hat_names)
+    fi
+
+    local hat
+    while IFS= read -r hat; do
+        [[ -z "$hat" ]] && continue
+        local host dir
+        host=$(hat_ssh "$hat"); dir=$(hat_dir "$hat")
+        [[ -n "$host" ]] || { warn "hat '$hat' has no ssh destination"; continue; }
+
+        local want
+        want=$(cfg --arg l "$hat" '
+            [ .groups[] | select(.hat == $l) | .sessions | keys[]? ] | length')
+        if [[ "${want:-0}" -eq 0 ]]; then
+            echo "  $hat: nothing recorded, skipping"
+            continue
+        fi
+
+        # Probe before opening a window, so an unreachable hat does not leave an
+        # empty one behind, and never let one bad hat abort the whole restore.
+        if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" true 2>/dev/null; then
+            warn "$hat: $host unreachable, skipping"
+            continue
+        fi
+
+        info "Restoring hat '$hat' ($host)"
+
+        # 1. make sure every recorded session exists on the server
+        local group session windows
+        while IFS= read -r group; do
+            [[ -z "$group" ]] && continue
+            while IFS= read -r session; do
+                [[ -z "$session" ]] && continue
+                windows=$(cfg --arg g "$group" --arg s "$session" '.groups[$g].sessions[$s].windows // []')
+                ensure_remote_session "$host" "$session" "$dir" "$windows"
+            done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+        done < <(groups_of_hat "$hat")
+
+        # 2. one window, one mirror pass
+        local win
+        win=$(ensure_hat_window "$hat")
+        mirror_hat "$hat" "$win"
+
+        # 3. put the workspaces back in their groups, restyle
+        local gref wref
+        while IFS= read -r group; do
+            [[ -z "$group" ]] && continue
+            gref=$(ensure_cmux_group "$group" "$win")
+            while IFS= read -r session; do
+                [[ -z "$session" ]] && continue
+                wref=$(wait_for_workspace "$session" "$win" 20)
+                if [[ -z "$wref" ]]; then
+                    warn "no workspace appeared for '$session'"
+                    continue
+                fi
+                cmux workspace-group add --group "$gref" --workspace "$wref" >/dev/null 2>&1 || true
+                echo "  ok  $hat / $group / $session -> $wref"
+            done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+            apply_group_style "$group" "$gref"
+        done < <(groups_of_hat "$hat")
+        discard_stray_workspace "$win"
+    done <<<"$hats"
+
+    info "Restore complete"
+}
+
+cmd_provision() {
+    local token="${1:-}"
+    [[ -n "$token" ]] || die "usage: hatter provision <hat|user@host>"
+    local host
+    if [[ "$token" == *@* ]]; then
+        host="$token"
+    elif hat_exists "$token"; then
+        host=$(hat_ssh "$token")
+    elif group_exists "$token"; then
+        host=$(hat_ssh "$(group_hat "$token")")
+    else
+        die "unknown hat or group: $token"
+    fi
+    provision_host "$host"
+}
+
+cmd_list() {
+    echo "config: $CONFIG"
+    echo
+    local hat group
+    while IFS= read -r hat; do
+        [[ -z "$hat" ]] && continue
+        local dg
+        dg=$(hat_default_group "$hat")
+        printf 'window "%s"  ->  %s  [%s]%s\n' "$hat" "$(hat_ssh "$hat")" "$(hat_dir "$hat")" \
+            "${dg:+  (default group: $dg)}"
+        while IFS= read -r group; do
+            [[ -z "$group" ]] && continue
+            printf '  group %s\n' "$group"
+            cfg --arg g "$group" '.groups[$g].sessions | to_entries[]
+                | "    \(.key)  (\(.value.windows | length) tabs)"'
+        done < <(groups_of_hat "$hat")
+        echo
+    done < <(hat_names)
+
+    local orphans
+    orphans=$(cfg '.groups | to_entries[] | select((.value.hat // "") == "") | .key')
+    [[ -n "$orphans" ]] && { echo "groups with no hat:"; sed 's/^/  /' <<<"$orphans"; echo; }
+
+    echo "live cmux windows:"
+    local w
+    for w in $(window_ids); do
+        printf '  %s\n' "$w"
+        groups_in_window "$w" | sed 's/^/    /'
+    done
+}
+
+# ---------------------------------------------------------------- autosave
+#
+# Two separate safety nets, on purpose:
+#
+#   autosave   plain copies of config.json under ~/.config/hatter/autosave.
+#              Every hatter run leaves one, and a launchd timer takes one a
+#              minute so that renames done inside cmux are caught too. At most
+#              one is *kept* per 8-hour window, and at most 8 windows, so the
+#              directory holds roughly the last two and a half days and never
+#              grows. Nothing here touches git.
+#
+#   backup     `hatter backup` - a real git commit, pushed to the dotfiles
+#              remote, kept forever. That is the deliberate checkpoint.
+#
+# Autosaves are for "undo the last hour", backups are for "what did this look
+# like last month".
+
+AUTOSAVE_DIR="$CONFIG_DIR/autosave"
+AUTOSAVE_WINDOW=28800      # 8 hours, in seconds
+AUTOSAVE_KEEP=8            # windows retained -> ~64 hours of history
+AUTOSAVE_PLIST="$HOME/Library/LaunchAgents/org.hatter.autosave.plist"
+AUTOSAVE_LABEL="org.hatter.autosave"
+
+# BSD date takes -r for an epoch, GNU date takes -d @.
+autosave_stamp() {
+    date -u -r "$1" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u -d "@$1" +%Y%m%dT%H%M%SZ
+}
+
+autosave_files() { ls -1 "$AUTOSAVE_DIR"/config-*.json 2>/dev/null | sort; }
+autosave_latest() { printf '%s/latest.json' "$AUTOSAVE_DIR"; }
+
+autosave_prune() {
+    local count drop old
+    count=$(autosave_files | wc -l | tr -d ' ')
+    [[ "$count" -gt "$AUTOSAVE_KEEP" ]] || return 0
+    drop=$((count - AUTOSAVE_KEEP))
+    # macOS head takes no negative count, so the cut is worked out from the total.
+    while IFS= read -r old; do
+        [[ -n "$old" ]] && rm -f "$old"
+    done < <(autosave_files | sed -n "1,${drop}p")
+}
+
+# latest.json always mirrors the config. config-<window>.json freezes what the
+# config looked like when that 8-hour window opened, and is never rewritten -
+# which is the whole point: eight checkpoints have to be eight *different*
+# moments, not one slot overwritten all window long.
+autosave_snapshot() {
+    [[ -f "$CONFIG" ]] || return 0
+    mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || return 0
+
+    local latest; latest=$(autosave_latest)
+    cmp -s "$CONFIG" "$latest" 2>/dev/null && return 0
+
+    local win f made=""
+    win=$(( $(date +%s) / AUTOSAVE_WINDOW * AUTOSAVE_WINDOW ))
+    f="$AUTOSAVE_DIR/config-$(autosave_stamp "$win").json"
+    if [[ ! -f "$f" ]]; then
+        # Carry the pre-change state into the checkpoint; on a first ever run
+        # there is nothing older, so the current config stands in.
+        if [[ -s "$latest" ]]; then cp "$latest" "$f.tmp"; else cp "$CONFIG" "$f.tmp"; fi
+        mv "$f.tmp" "$f"
+        made="$f"
+        autosave_prune
+    fi
+    cp "$CONFIG" "$latest.tmp" && mv "$latest.tmp" "$latest"
+    printf '%s\n' "${made:-$latest}"
+}
+
+autosave_install() {
+    mkdir -p "$(dirname "$AUTOSAVE_PLIST")" "$AUTOSAVE_DIR"
+    local self extra d
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+    # launchd starts from a bare PATH, and cmux lives inside its .app bundle
+    # rather than anywhere standard - so the directories are taken from where
+    # the tools actually are on this machine, not guessed.
+    extra=""
+    for d in "$(dirname "$(command -v cmux)")" "$(dirname "$(command -v jq)")"; do
+        case ":$extra:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" in
+            *":$d:"*) ;;
+            *) extra="$extra$d:" ;;
+        esac
+    done
+    # launchd starts with a bare environment, so PATH has to carry jq, cmux and
+    # ssh explicitly. SSH_AUTH_SOCK is inherited from the user's launchd
+    # session, which is where the agent socket already lives.
+    cat > "$AUTOSAVE_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AUTOSAVE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$self</string>
+    <string>autosave</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$extra$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>$HOME</string>
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$AUTOSAVE_DIR/autosave.log</string>
+  <key>StandardErrorPath</key><string>$AUTOSAVE_DIR/autosave.log</string>
+</dict>
+</plist>
+PLIST
+    launchctl bootout "gui/$(id -u)/$AUTOSAVE_LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$AUTOSAVE_PLIST"
+    info "Autosave timer installed: every 60s, $AUTOSAVE_PLIST"
+    info "Log: $AUTOSAVE_DIR/autosave.log"
+}
+
+autosave_uninstall() {
+    launchctl bootout "gui/$(id -u)/$AUTOSAVE_LABEL" 2>/dev/null || true
+    rm -f "$AUTOSAVE_PLIST"
+    info "Autosave timer removed (existing snapshots kept)"
+}
+
+cmd_autosave() {
+    local sub="${1:-run}"; [[ $# -gt 0 ]] && shift || true
+    case "$sub" in
+        run|"")
+            # What the timer runs: pick up anything renamed inside cmux, then
+            # snapshot. Sync failures must not stop the snapshot.
+            hatter_lock 0 || return 0          # a command is mid-write; try next minute
+            trap hatter_unlock EXIT
+            cmd_sync >/dev/null 2>&1 || warn "autosave: sync failed, snapshotting anyway"
+            local f
+            f=$(autosave_snapshot) || true
+            [[ -n "$f" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave -> $(basename "$f")"
+            return 0 ;;
+        now|snapshot)
+            local f; f=$(autosave_snapshot) || true
+            if [[ -n "$f" ]]; then info "Snapshot: $f"; else info "No change since the last snapshot"; fi ;;
+        list|ls)
+            local i=0 f age latest
+            echo "Checkpoints - the config as each 8h window opened (max $AUTOSAVE_KEEP):"
+            while IFS= read -r f; do
+                [[ -z "$f" ]] && continue
+                i=$((i+1))
+                age=$(basename "$f" | sed 's/^config-//; s/\.json$//')
+                printf '  %d  %s  %s bytes%s\n' "$i" "$age" \
+                    "$(wc -c < "$f" | tr -d ' ')" \
+                    "$(cmp -s "$CONFIG" "$f" && echo '   = config as it stands' || true)"
+            done < <(autosave_files)
+            [[ $i -eq 0 ]] && echo "  (none yet)"
+            latest=$(autosave_latest)
+            echo
+            if [[ -f "$latest" ]]; then
+                printf '  latest  %s  %s bytes%s\n' \
+                    "$(date -r "$latest" '+%Y-%m-%d %H:%M:%S')" \
+                    "$(wc -c < "$latest" | tr -d ' ')" \
+                    "$(cmp -s "$CONFIG" "$latest" && echo '   = config as it stands' || true)"
+                echo "  (the rolling save - rewritten whenever the config changes)"
+            fi
+            echo
+            echo "Roll back with: hatter autosave restore <n|latest>"
+            echo "Permanent, unlimited history lives in git: hatter backup [message]" ;;
+        restore)
+            local n="${1:-}"
+            [[ -n "$n" ]] || die "usage: hatter autosave restore <n|latest>   (see: hatter autosave list)"
+            local f
+            if [[ "$n" == "latest" ]]; then f=$(autosave_latest); else f=$(autosave_files | sed -n "${n}p"); fi
+            [[ -n "$f" && -f "$f" ]] || die "no autosave '$n' - see: hatter autosave list"
+            jq -e . < "$f" >/dev/null 2>&1 || die "autosave #$n is not valid JSON: $f"
+            # The config being replaced is itself worth keeping.
+            autosave_snapshot >/dev/null || true
+            backup_config
+            cp "$f" "$CONFIG"
+            info "Config rolled back to $(basename "$f")  (previous saved as $CONFIG.bak)"
+            info "Apply it to the client with: hatter restore" ;;
+        install)   autosave_install ;;
+        uninstall) autosave_uninstall ;;
+        status)
+            if launchctl print "gui/$(id -u)/$AUTOSAVE_LABEL" >/dev/null 2>&1; then
+                info "Timer: loaded, every 60s"
+            else
+                info "Timer: not installed  (install with: hatter autosave install)"
+            fi
+            printf '  snapshots: %s of %s\n' "$(autosave_files | wc -l | tr -d ' ')" "$AUTOSAVE_KEEP"
+            printf '  directory: %s\n' "$AUTOSAVE_DIR" ;;
+        *) die "unknown autosave subcommand: $sub (run|now|list|restore|install|uninstall|status)" ;;
+    esac
+}
+
+# -------------------------------------------------------------- credentials
+#
+# A credential is one Claude login. They live on this Mac only - in the macOS
+# Keychain, managed by cswap - and are pushed to a hat over ssh when that hat
+# needs to run Claude Code. Nothing here ever asks a shell server to log in.
+#
+# One credential per hat is the recommended arrangement. Sharing one account
+# across several machines is allowed by Claude Code, but each machine refreshes
+# the OAuth token independently and a refresh may rotate the refresh token, so
+# a shared account can be logged out from under whoever refreshed last. Pushing
+# again fixes it, but assigning a different account to each hat avoids it.
+
+CSWAP_BIN="${HATTER_CSWAP:-cswap}"
+
+# The letter column in `hatter creds` and in edit mode. 'q' is left out because
+# it quits the interactive browser.
+CRED_LETTERS='abcdefghijklmnoprstuvwxyz'
+
+have_cswap() { command -v "$CSWAP_BIN" >/dev/null 2>&1; }
+
+need_cswap() {
+    have_cswap || die "cswap is not installed - credentials come from it.
+  Install with: uv tool install claude-swap"
+}
+
+# One TSV row per credential:
+#   letter  slot  email  label  5h-used%  7d-used%  open|limited  active|''
+# One TSV row per credential. pct from cswap is percent *used*, so everything
+# downstream works in remaining = 100 - pct. resetsAt carries fractional seconds
+# and a +00:00 offset, neither of which fromdateiso8601 accepts.
+#   letter  slot  email  label  rem5  rem7  reset5s  reset7s  active
+creds_rows() {
+    have_cswap || return 0
+    "$CSWAP_BIN" list --json 2>/dev/null | jq -r --arg L "$CRED_LETTERS" '
+        def eta: if . == null then -1
+                 else (sub("\\.[0-9]+"; "") | sub("\\+00:00"; "Z")
+                       | fromdateiso8601) - (now | floor) end;
+        [.accounts[]?] | to_entries[]
+        | .key as $i | .value as $a
+        | (100 - (($a.usage.fiveHour.pct // 0) | floor)) as $r5
+        | (100 - (($a.usage.sevenDay.pct  // 0) | floor)) as $r7
+        | [ $L[$i:$i+1], ($a.number | tostring), $a.email,
+            ($a.alias // $a.organizationName // ""),
+            ($r5 | tostring), ($r7 | tostring),
+            (($a.usage.fiveHour.resetsAt | eta) | floor | tostring),
+            (($a.usage.sevenDay.resetsAt  | eta) | floor | tostring),
+            (if $a.active then "active" else "" end) ]
+        | @tsv' 2>/dev/null || true
+}
+
+# A short bar of remaining capacity.
+creds_bar() {
+    local pct="$1" w="${2:-6}" filled i out=""
+    filled=$(( (pct * w + 50) / 100 ))
+    [[ $filled -gt $w ]] && filled=$w
+    [[ $filled -lt 0 ]] && filled=0
+    for (( i = 0; i < w; i++ )); do
+        # braces required: bash would otherwise read the block character as
+        # part of the variable name
+        if [[ $i -lt $filled ]]; then out="${out}█"; else out="${out}░"; fi
+    done
+    printf '%s' "$out"
+}
+
+# Time until a window resets, at one significant unit: minutes under an hour,
+# hours under a day, days beyond that.
+creds_eta() {
+    local sec="$1"
+    [[ -z "$sec" || "$sec" -lt 0 ]] 2>/dev/null && { printf '   -'; return 0; }
+    if   [[ "$sec" -lt 60 ]];    then printf 'now'
+    elif [[ "$sec" -lt 3600 ]];  then printf '%dm' $(( (sec + 30) / 60 ))
+    elif [[ "$sec" -lt 86400 ]]; then printf '%dh' $(( (sec + 1800) / 3600 ))
+    else                              printf '%dd' $(( (sec + 43200) / 86400 ))
+    fi
+}
+
+# Red when a window is spent, amber under half a 5-hour session, green above it.
+creds_dot() {
+    local r5="$1" r7="$2"
+    if   [[ "$r5" -le 0 || "$r7" -le 0 ]]; then printf '%s●%s' "$C_RD" "$C_R"
+    elif [[ "$r5" -lt 50 ]];               then printf '%s●%s' "$C_YL" "$C_R"
+    else                                        printf '%s●%s' "$C_GR" "$C_R"
+    fi
+}
+
+# 5h and 7d remaining, as bar + percent + time to reset.
+creds_gauges() {
+    local r5="$1" r7="$2" e5="$3" e7="$4"
+    printf '5h %s %3s%% %4s   7d %s %3s%% %4s' \
+        "$(creds_bar "$r5")" "$r5" "$(creds_eta "$e5")" \
+        "$(creds_bar "$r7")" "$r7" "$(creds_eta "$e7")"
+}
+
+# Accept a letter, a cswap slot number, or any unique substring of an email.
+creds_resolve() {
+    local sel="$1" letter slot email rest hit="" n=0
+    while IFS=$'\t' read -r letter slot email rest; do
+        [[ -z "$email" ]] && continue
+        if [[ "$sel" == "$letter" || "$sel" == "$slot" || "$sel" == "$email" ]]; then
+            printf '%s' "$email"; return 0
+        fi
+        case "$email" in *"$sel"*) hit="$email"; n=$((n+1)) ;; esac
+    done < <(creds_rows)
+    [[ $n -eq 1 ]] && { printf '%s' "$hit"; return 0; }
+    [[ $n -gt 1 ]] && { warn "'$sel' matches $n credentials - be more specific"; return 1; }
+    return 1
+}
+
+hat_credential() { cfg --arg l "$1" '.hats[$l].credential // empty'; }
+
+set_hat_credential() {
+    jq_write --arg l "$1" --arg e "$2" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.hats[$l].credential = $e | .hats[$l].credential_pushed_at = $t'
+}
+
+# Which hats hold this credential, per the config, comma separated.
+creds_hats_holding() {
+    cfg --arg e "$1" '[.hats | to_entries[] | select(.value.credential == $e) | .key] | join(", ")'
+}
+
+creds_push_to() {
+    local email="$1" hat="$2" host out
+    hat_exists "$hat" || { warn "unknown hat: $hat"; return 1; }
+    host=$(hat_ssh "$hat")
+    info "Pushing $email -> $hat ($host)"
+    # The export carries a live refresh token, so it goes straight down the ssh
+    # pipe: it is never written to disk on either side.
+    if out=$("$CSWAP_BIN" export - --account "$email" \
+             | ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 "$host" \
+                   'python3 "$HOME/.local/bin/hat-creds" install' 2>&1); then
+        echo "    ${out##*$'\n'}"
+        set_hat_credential "$hat" "$email"
+        return 0
+    fi
+    warn "push to $hat failed: ${out:-no output}"
+    case "$out" in
+        *"No such file"*|*"can't open file"*)
+            warn "run: hatter provision $hat   (installs hat-creds on the server)" ;;
+    esac
+    return 1
+}
+
+creds_probe_hat() {
+    ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$(hat_ssh "$1")" \
+        'python3 "$HOME/.local/bin/hat-creds" status' 2>/dev/null || true
+}
+
+cmd_creds() {
+    local sub="${1:-list}"; [[ $# -gt 0 ]] && shift || true
+    case "$sub" in
+        list|ls|"")
+            need_cswap
+            colour_setup
+            local letter slot email label r5 r7 e5 e7 active holders
+            echo "Credentials (on this Mac, in the Keychain via cswap):"
+            echo "  bars are capacity left, then time to the window reset"
+            while IFS=$'\t' read -r letter slot email label r5 r7 e5 e7 active; do
+                [[ -z "$email" ]] && continue
+                holders=$(creds_hats_holding "$email")
+                printf '  %s %s %-28s %s%s%s\n' \
+                    "$letter" "$(creds_dot "$r5" "$r7")" "$email" \
+                    "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
+                    "${active:+  ${C_CY}<- active here${C_R}}" \
+                    "${holders:+  ${C_DIM}-> $holders${C_R}}"
+            done < <(creds_rows)
+            echo
+            echo "Hats and the credential each one holds:"
+            local hat cred
+            while IFS= read -r hat; do
+                [[ -z "$hat" ]] && continue
+                cred=$(hat_credential "$hat")
+                printf '  %-11s %-26s %s\n' "$hat" "$(hat_ssh "$hat")" \
+                    "${cred:-(none pushed)}"
+            done < <(hat_names)
+            echo
+            echo "Push one with: hatter creds push <letter> <hat>"
+            ;;
+        push)
+            need_cswap
+            local sel="${1:-}"; shift || true
+            [[ -n "$sel" ]] || die "usage: hatter creds push <letter|slot|email> <hat...|--all>"
+            local email
+            email=$(creds_resolve "$sel") || die "no credential matches '$sel' - see: hatter creds"
+            local targets=() hat rc=0
+            if [[ "${1:-}" == "--all" ]]; then
+                while IFS= read -r hat; do [[ -n "$hat" ]] && targets+=("$hat"); done < <(hat_names)
+            else
+                [[ $# -gt 0 ]] || die "which hat? usage: hatter creds push $sel <hat...|--all>"
+                targets=("$@")
+            fi
+            for hat in "${targets[@]}"; do
+                creds_push_to "$email" "$hat" || rc=1
+            done
+            return $rc
+            ;;
+        status)
+            local hat js
+            local want="${1:-}"
+            while IFS= read -r hat; do
+                [[ -z "$hat" ]] && continue
+                [[ -n "$want" && "$hat" != "$want" ]] && continue
+                js=$(creds_probe_hat "$hat")
+                if [[ -z "$js" ]]; then
+                    printf '  %-11s %s\n' "$hat" "unreachable, or hat-creds not installed"
+                    continue
+                fi
+                printf '  %-11s %s\n' "$hat" "$(printf '%s' "$js" | jq -r '
+                    if .kind == "none" then "no credential installed"
+                    elif .kind == "api_key" then "API key installed"
+                    elif .expired == true and (.hasRefreshToken | not) then
+                        "\(.email // "?") - dead, push it again"
+                    elif .expired == true then
+                        "\(.email // "?")  stale, refreshes itself on next run"
+                    else "\(.email // "?")  token ok for \(((.expiresInSeconds // 0) / 60) | floor)m"
+                    end')"
+            done < <(hat_names)
+            ;;
+        clear)
+            local hat="${1:-}"
+            [[ -n "$hat" ]] || die "usage: hatter creds clear <hat>"
+            hat_exists "$hat" || die "unknown hat: $hat"
+            remote_sh "$(hat_ssh "$hat")" 'python3 "$HOME/.local/bin/hat-creds" clear' || true
+            jq_write --arg l "$hat" 'del(.hats[$l].credential, .hats[$l].credential_pushed_at)'
+            info "Cleared the credential on '$hat'"
+            ;;
+        *) die "unknown creds subcommand: $sub (list|push|status|clear)" ;;
+    esac
+}
+
+# ----------------------------------------------------------------- edit mode
+#
+# An interactive walk down hat > group > workspace > tab. Every screen names
+# the level and says what it is, so the vocabulary is learned by browsing.
+#
+# Up/Down move the highlight, Enter or Right descends, Left/Esc/Backspace goes
+# back, digits jump straight to an item. Written for bash 3.2 (macOS system
+# bash): indexed arrays only, no associative arrays, no mapfile.
+
+EDIT_CACHE=""
+KEY=""
+
+# Row icons, kept together so the set can be changed in one place. The hat is a
+# plain caret - at one character a silhouette reads better than a detailed
+# emoji, and ^ needs no font support anywhere.
+ICON_HAT="^"
+ICON_GROUP="📂"
+ICON_WORKSPACE="📁"
+ICON_TAB="⌨️"
+
+colour_setup() {
+    if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+        C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_R=$'\033[0m'; C_SEL=$'\033[7m'
+        C_CY=$'\033[36m'; C_GR=$'\033[32m'; C_YL=$'\033[33m'; C_RD=$'\033[31m'
+    else
+        C_DIM=""; C_B=""; C_R=""; C_SEL=""
+        C_CY=""; C_GR=""; C_YL=""; C_RD=""
+    fi
+}
+
+edit_cleanup() {
+    [[ -n "$EDIT_CACHE" ]] && rm -rf "$EDIT_CACHE"
+    printf '\033[?25h'                       # cursor back on
+}
+
+# Read one keypress. Arrow keys arrive as ESC [ A..D, so a bare ESC has to be
+# told apart from the start of a sequence by a short timeout. bash 3.2's read
+# only takes whole-second timeouts, hence -t 1.
+edit_readkey() {
+    local k rest
+    IFS= read -rsn1 k < /dev/tty || { KEY=quit; return; }
+    case "$k" in
+        $'\e')
+            if IFS= read -rsn2 -t 1 rest < /dev/tty; then
+                case "$rest" in
+                    '[A') KEY=up ;;    '[B') KEY=down ;;
+                    '[C') KEY=right ;; '[D') KEY=left ;;
+                    '[H') KEY=home ;;  '[F') KEY=end ;;
+                    *)    KEY=esc ;;
+                esac
+            else
+                KEY=esc
+            fi ;;
+        '')             KEY=enter ;;
+        $'\x7f'|$'\b')  KEY=back ;;
+        *)              KEY="$k" ;;
+    esac
+}
+
+edit_ask()   { printf '\033[?25h  %s: ' "$1" >&2; read -r EDIT_REPLY < /dev/tty; printf '\033[?25l'; }
+edit_pause() { printf '\n  %spress any key%s ' "$C_DIM" "$C_R" >&2; edit_readkey; }
+edit_confirm() {
+    printf '  %s%s%s [y/N] ' "$C_YL" "$1" "$C_R" >&2
+    edit_readkey
+    case "$KEY" in y|Y) printf 'yes\n' >&2; return 0 ;; *) printf 'no\n' >&2; return 1 ;; esac
+}
+
+# --- cached remote reads ----------------------------------------------------
+
+edit_sessions_file() { printf '%s/sessions.%s' "$EDIT_CACHE" "$1"; }
+
+# One ssh trip per hat brings back both the session list and the credential
+# installed there, split on a sentinel line.
+edit_fetch_hat() {
+    local hat="$1" host f
+    host=$(hat_ssh "$hat"); f=$(edit_sessions_file "$hat")
+    : > "$f"; : > "$f.cred"
+    ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+        "tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}' 2>/dev/null; printf '@@@\n'; python3 \"\$HOME/.local/bin/hat-creds\" status 2>/dev/null || true" \
+        > "$f.raw" 2>/dev/null || : > "$f.raw"
+    awk -v sf="$f" -v cf="$f.cred" \
+        '/^@@@$/ { seen = 1; next } seen { print > cf; next } { print > sf }' \
+        "$f.raw" 2>/dev/null || true
+    rm -f "$f.raw"
+}
+
+edit_hat_cred() {
+    local f="$(edit_sessions_file "$1").cred"
+    [[ -s "$f" ]] || return 0
+    jq -r '.email // ""' < "$f" 2>/dev/null || true
+}
+
+# "" when the hat could not be read at all, so the row can stay silent instead
+# of claiming there is no credential.
+edit_hat_cred_state() {
+    local f="$(edit_sessions_file "$1").cred"
+    [[ -s "$f" ]] || return 0
+    jq -r 'if .kind == "none" then "none"
+           elif .expired == true and (.hasRefreshToken | not) then "dead"
+           elif .expired == true then "stale"
+           else "ok" end' < "$f" 2>/dev/null || true
+}
+
+edit_refresh_all() {
+    local hat
+    printf '  %sprobing hats...%s\n' "$C_DIM" "$C_R" >&2
+    while IFS= read -r hat; do
+        [[ -z "$hat" ]] && continue
+        edit_fetch_hat "$hat" &
+    done < <(hat_names)
+    wait
+}
+
+edit_session_field() {
+    awk -F'\t' -v s="$2" -v c="$3" '$1==s {print $c; exit}' "$(edit_sessions_file "$1")" 2>/dev/null
+}
+
+edit_windows() {
+    local hat="$1" session="$2" host
+    host=$(hat_ssh "$hat")
+    ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
+        "tmux list-windows -t '=$session' -F '#{window_index}	#{window_name}	#{window_active}	#{window_panes}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}' 2>/dev/null" \
+        2>/dev/null
+}
+
+# --- chrome -----------------------------------------------------------------
+
+edit_trunc() {
+    local v="$1" w="$2"
+    if [[ ${#v} -le $w ]]; then printf '%s' "$v"; else printf '%s…' "${v:0:$((w-1))}"; fi
+}
+
+edit_trunc_left() {
+    local v="$1" w="$2"
+    if [[ ${#v} -le $w ]]; then printf '%s' "$v"; else printf '…%s' "${v:$(( ${#v} - w + 1 ))}"; fi
+}
+
+edit_short_path() {
+    local v="$1"
+    case "$v" in
+        /home/*/*)  v="~/${v#/home/*/}" ;;
+        /home/*)    v="~" ;;
+        /Users/*/*) v="~/${v#/Users/*/}" ;;
+        /Users/*)   v="~" ;;
+    esac
+    printf '%s' "$v"
+}
+
+edit_header() {
+    printf '\033[?25l\033[H\033[2J'
+    printf '%s──── hatter edit ──────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
+    printf '  %s%s%s\n' "$C_CY" "${1:-all hats}" "$C_R"
+    printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
+    printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$2" "$C_R" "$C_DIM" "$3" "$C_R"
+    [[ -n "${4:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$4" "$C_R"
+    printf '\n'
+}
+
+# edit_row <index> <selected-index> <name> <width> <meta...>
+#
+# ROW_LABEL overrides the number in the left column (the credential list is
+# lettered); ROW_ICON is the level's icon. Both are set per screen rather than
+# passed, so the four call sites stay readable.
+ROW_LABEL=""
+ROW_ICON=""
+
+edit_row() {
+    local i="$1" sel="$2" name="$3" w="$4"; shift 4
+    local marker="  " open="" close="" label
+    label=$(printf '%2s' "${ROW_LABEL:-$i}")
+    if [[ "$i" == "$sel" ]]; then
+        marker="${C_CY}▸${C_R} "; open="$C_SEL"; close="$C_R"
+    fi
+    printf ' %s%s%s%s %s%s%-*s%s %s\n' \
+        "$marker" "$C_B" "$label" "$C_R" "$ROW_ICON " \
+        "$open" "$w" "$(edit_trunc "$name" "$w")" "$close" "$*"
+}
+
+edit_keys() {
+    printf '\n  %s↑↓ move   → enter open   ← esc back   1-9 jump   %s%s\n' \
+        "$C_DIM" "$1" "$C_R"
+}
+
+# Move the highlight. Returns 0 if the key was a navigation key.
+edit_nav() {
+    local n="$2"
+    case "$1" in
+        up)    SEL=$((SEL-1)); [[ $SEL -lt 1 ]] && SEL=$n ;;
+        down)  SEL=$((SEL+1)); [[ $SEL -gt $n ]] && SEL=1 ;;
+        home)  SEL=1 ;;
+        end)   SEL=$n ;;
+        [1-9]) [[ "$1" -le $n && "$1" -ge 1 ]] && SEL=$1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# --- level 1: credentials and hats ------------------------------------------
+#
+# The top screen holds two lists at once: the Claude logins on this Mac
+# (lettered) and the hats they can be pushed to (numbered). Up/Down runs
+# through both; a letter or a digit jumps straight into either one.
+
+edit_top() {
+    local SEL=1 nc nh nt i idx hat host state sess cred credstate dot
+    local letter slot email label r5 r7 e5 e7 active
+    while :; do
+        CLETTER=(); CEMAIL=(); CMETA=(); CICON=(); nc=0
+        while IFS=$'\t' read -r letter slot email label r5 r7 e5 e7 active; do
+            [[ -z "$email" ]] && continue
+            CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
+            CICON[$nc]=$(creds_dot "$r5" "$r7")
+            CMETA[$nc]=$(printf '%s%s' \
+                "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
+                "${active:+  ${C_CY}<- active on this Mac${C_R}}")
+            nc=$((nc+1))
+        done < <(creds_rows)
+
+        HATS=(); nh=0
+        while IFS= read -r hat; do
+            [[ -z "$hat" ]] && continue
+            HATS[$nh]="$hat"; nh=$((nh+1))
+        done < <(hat_names)
+
+        nt=$((nc+nh))
+        [[ $SEL -gt $nt ]] && SEL=$nt
+        [[ $SEL -lt 1 ]] && SEL=1
+
+        edit_header "" "CREDENTIALS" \
+            "one Claude login each. Bars are capacity left, then time to reset;" \
+            "the dot is red spent, amber under half a session, green above."
+
+        i=0
+        while [[ $i -lt $nc ]]; do
+            ROW_LABEL="${CLETTER[$i]}"; ROW_ICON="${CICON[$i]}"
+            edit_row $((i+1)) "$SEL" "${CEMAIL[$i]}" 28 "${CMETA[$i]}"
+            i=$((i+1))
+        done
+        ROW_LABEL=""; ROW_ICON=""
+        [[ $nc -eq 0 ]] && \
+            printf '   %s(no credentials - is cswap installed?)%s\n' "$C_DIM" "$C_R"
+
+        printf '\n  %sHATS%s  %s·  a hat is a login (user@host): one ssh connection,%s\n' \
+            "$C_B" "$C_R" "$C_DIM" "$C_R"
+        printf '     %sone tmux server, one cmux window.%s\n\n' "$C_DIM" "$C_R"
+
+        i=0
+        while [[ $i -lt $nh ]]; do
+            hat="${HATS[$i]}"; host=$(hat_ssh "$hat")
+            if [[ -s "$(edit_sessions_file "$hat")" ]]; then
+                sess=$(wc -l < "$(edit_sessions_file "$hat")" | tr -d ' ')
+                state=$(printf '%s● up%s %s ws' "$C_GR" "$C_R" "$sess")
+            elif [[ -f "$(edit_sessions_file "$hat")" ]]; then
+                state=$(printf '%s○ no tmux%s' "$C_YL" "$C_R")
+            else
+                state=$(printf '%s?  unprobed%s' "$C_DIM" "$C_R")
+            fi
+            cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
+            # Reuse the credential's own dot so a hat shows the health of the
+            # account it is actually holding.
+            dot=""
+            idx=0
+            while [[ $idx -lt $nc ]]; do
+                [[ "${CEMAIL[$idx]}" == "$cred" ]] && { dot="${CICON[$idx]} "; break; }
+                idx=$((idx+1))
+            done
+            case "$credstate" in
+                ok|stale) cred=$(printf '%s%s%s%s' "$dot" "$C_DIM" "${cred%%@*}" "$C_R") ;;
+                dead)     cred=$(printf '%s%s%s dead%s' "$dot" "$C_RD" "${cred%%@*}" "$C_R") ;;
+                none)     cred=$(printf '%sno credential%s' "$C_DIM" "$C_R") ;;
+                *)        cred=$(printf '%snot provisioned%s' "$C_YL" "$C_R") ;;
+            esac
+            ROW_LABEL="$((i+1))"; ROW_ICON="$ICON_HAT"
+            edit_row $((nc+i+1)) "$SEL" "$hat" 11 \
+                "$(printf '%s%-24s%s %-14s %s' "$C_DIM" "$host" "$C_R" "$state" "$cred")"
+            i=$((i+1))
+        done
+        ROW_ICON=""
+        [[ $nh -eq 0 ]] && printf '   %s(no hats yet - press A to add one)%s\n' "$C_DIM" "$C_R"
+
+        printf '\n  %s↑↓ move   a-z credential   1-9 hat   → enter open   q quit%s\n' \
+            "$C_DIM" "$C_R"
+        printf '  %sA add hat   R rename   D forget   P provision   ! refresh%s\n' \
+            "$C_DIM" "$C_R"
+
+        edit_readkey
+
+        # Digits and letters are absolute jumps into their own list, so they are
+        # read before edit_nav, whose digit handling counts from the top of the
+        # combined one. This is also why the vim h/l aliases are not bound here:
+        # with enough logins they would be credential letters.
+        case "$KEY" in
+            q|Q|quit) return 0 ;;
+            [1-9])
+                [[ "$KEY" -le $nh ]] && SEL=$((nc + KEY))
+                continue ;;
+            [a-z])
+                # Only a letter that is actually in the credential column is a
+                # jump; anything else falls through to the action keys below.
+                i=0
+                while [[ $i -lt $nc ]]; do
+                    if [[ "${CLETTER[$i]}" == "$KEY" ]]; then SEL=$((i+1)); break; fi
+                    i=$((i+1))
+                done
+                [[ $i -lt $nc ]] && continue ;;
+        esac
+        edit_nav "$KEY" "$nt" && continue
+
+        idx=$((SEL-1))
+        if [[ $idx -lt $nc ]]; then hat=""; else hat="${HATS[$((idx-nc))]:-}"; fi
+
+        case "$KEY" in
+            q|Q|quit) return 0 ;;
+            left|esc|back) : ;;                       # nothing above this level
+            enter|right)
+                if [[ $idx -lt $nc && $nc -gt 0 ]]; then
+                    edit_credential "${CEMAIL[$idx]}" || return 0
+                elif [[ -n "$hat" ]]; then
+                    edit_groups "$hat" || return 0
+                fi
+                : ;;
+            !) edit_refresh_all ;;
+            A)
+                edit_ask "new hat name (the session prefix)"; local nh_name="$EDIT_REPLY"
+                [[ -z "$nh_name" ]] && continue
+                edit_ask "ssh destination (user@host)"; local nhost="$EDIT_REPLY"
+                edit_ask "remote dir [\$HOME]"; local dir="${EDIT_REPLY:-\$HOME}"
+                edit_ask "default group for new workspaces"; local g="$EDIT_REPLY"
+                register_hat "$nh_name" "$nhost" "$dir" "$g"
+                [[ -n "$g" ]] && { group_exists "$g" || register_group "$g" "$nh_name"; }
+                edit_fetch_hat "$nh_name"; edit_pause ;;
+            R)
+                [[ -z "$hat" ]] && continue
+                edit_ask "new name for hat '$hat'"
+                [[ -n "$EDIT_REPLY" ]] && { cmd_hat rename "$hat" "$EDIT_REPLY" || true; edit_refresh_all; }
+                edit_pause ;;
+            D)
+                [[ -z "$hat" ]] && continue
+                if edit_confirm "forget hat '$hat'? (config only - the server is untouched)"; then
+                    cmd_hat rm "$hat" || true; edit_pause
+                fi ;;
+            P)
+                [[ -z "$hat" ]] && continue
+                cmd_provision "$hat" || true; edit_pause ;;
+        esac
+    done
+}
+
+# --- level 2 (from a credential): push it to a hat ---------------------------
+
+edit_credential() {
+    local email="$1" SEL=1 n i hat host cred credstate held
+    while :; do
+        HATS=(); n=0
+        while IFS= read -r hat; do
+            [[ -z "$hat" ]] && continue
+            HATS[$n]="$hat"; n=$((n+1))
+        done < <(hat_names)
+        [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
+
+        edit_header "$email" "PUSH TO A HAT" \
+            "the login travels down the ssh pipe and is written 0600 on the server." \
+            "One credential per hat is safest: a shared account can log itself out."
+
+        i=0
+        while [[ $i -lt $n ]]; do
+            hat="${HATS[$i]}"; host=$(hat_ssh "$hat")
+            cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
+            if [[ -z "$credstate" ]]; then
+                held=$(printf '%snot provisioned - press P on the hats screen%s' "$C_YL" "$C_R")
+            elif [[ "$cred" == "$email" ]]; then
+                held=$(printf '%s✓ holds this one%s' "$C_GR" "$C_R")
+            elif [[ "$credstate" == "none" ]]; then
+                held=$(printf '%sno credential%s' "$C_DIM" "$C_R")
+            else
+                held=$(printf '%sholds %s%s' "$C_DIM" "$cred" "$C_R")
+            fi
+            ROW_LABEL=""; ROW_ICON="$ICON_HAT"
+            edit_row $((i+1)) "$SEL" "$hat" 11 \
+                "$(printf '%s%-24s%s %s' "$C_DIM" "$host" "$C_R" "$held")"
+            i=$((i+1))
+        done
+        ROW_ICON=""
+
+        printf '\n  %s↑↓ move   1-9 jump   → enter push here   ← esc back%s\n' "$C_DIM" "$C_R"
+        printf '  %sA push to every hat   X clear this hat   q quit%s\n' "$C_DIM" "$C_R"
+        edit_readkey
+        edit_nav "$KEY" "$n" && continue
+        hat="${HATS[$((SEL-1))]:-}"
+        case "$KEY" in
+            q|Q|quit) return 1 ;;
+            left|esc|back|h) return 0 ;;
+            enter|right|l)
+                [[ -z "$hat" ]] && continue
+                printf '\n'
+                creds_push_to "$email" "$hat" || true
+                edit_fetch_hat "$hat"; edit_pause ;;
+            A)
+                if edit_confirm "push $email to every hat?"; then
+                    printf '\n'
+                    for hat in "${HATS[@]:-}"; do
+                        [[ -z "$hat" ]] && continue
+                        creds_push_to "$email" "$hat" || true
+                    done
+                    edit_refresh_all; edit_pause
+                fi ;;
+            X)
+                [[ -z "$hat" ]] && continue
+                if edit_confirm "remove the credential from '$hat'?"; then
+                    printf '\n'
+                    cmd_creds clear "$hat" || true
+                    edit_fetch_hat "$hat"; edit_pause
+                fi ;;
+        esac
+    done
+}
+
+# --- level 2: groups --------------------------------------------------------
+
+edit_groups() {
+    local hat="$1" SEL=1 n g count i dg
+    while :; do
+        GRPS=(); n=0
+        while IFS= read -r g; do
+            [[ -z "$g" ]] && continue
+            GRPS[$n]="$g"; n=$((n+1))
+        done < <(groups_of_hat "$hat")
+        [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
+
+        edit_header "$hat" "GROUPS" \
+            "a group is a project or area inside one hat. Group names are free" \
+            "text and take no prefix; the workspaces inside them do."
+
+        i=0
+        while [[ $i -lt $n ]]; do
+            g="${GRPS[$i]}"
+            count=$(cfg --arg g "$g" '.groups[$g].sessions | length')
+            dg=""
+            [[ "$(hat_default_group "$hat")" == "$g" ]] && dg="  ${C_CY}(default)${C_R}"
+            ROW_LABEL=""; ROW_ICON="$ICON_GROUP"
+            edit_row $((i+1)) "$SEL" "$g" 28 \
+                "$(printf '%s%s workspace(s)%s%s' "$C_DIM" "$count" "$C_R" "$dg")"
+            i=$((i+1))
+        done
+        [[ $n -eq 0 ]] && printf '   %s(no groups in this hat yet - press a)%s\n' "$C_DIM" "$C_R"
+
+        edit_keys "a add   r rename   d forget   q quit"
+        edit_readkey
+        edit_nav "$KEY" "$n" && continue
+        g="${GRPS[$((SEL-1))]:-}"
+        case "$KEY" in
+            q|Q|quit) return 1 ;;
+            left|esc|back|h) return 0 ;;
+            enter|right|l)
+                [[ $n -gt 0 ]] && { edit_workspaces "$hat" "$g" || return 1; }
+                : ;;
+            a|A)
+                edit_ask "new group name"
+                if [[ -n "$EDIT_REPLY" ]]; then
+                    register_group "$EDIT_REPLY" "$hat"
+                    local w; w=$(ensure_hat_window "$hat")
+                    ensure_cmux_group "$EDIT_REPLY" "$w" >/dev/null
+                fi
+                edit_pause ;;
+            r|R)
+                [[ $n -eq 0 ]] && continue
+                edit_ask "new name for group '$g'"
+                [[ -n "$EDIT_REPLY" ]] && { cmd_group rename "$g" "$EDIT_REPLY" || true; edit_pause; } ;;
+            d|D)
+                [[ $n -eq 0 ]] && continue
+                if edit_confirm "forget group '$g'? (config only - workspaces keep running)"; then
+                    cmd_group rm "$g" || true; edit_pause
+                fi ;;
+        esac
+    done
+}
+
+# --- level 3: workspaces ----------------------------------------------------
+
+edit_workspaces() {
+    local hat="$1" group="$2" SEL=1 n ws i tabs att state
+    while :; do
+        WSS=(); n=0
+        while IFS= read -r ws; do
+            [[ -z "$ws" ]] && continue
+            WSS[$n]="$ws"; n=$((n+1))
+        done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+        [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
+
+        edit_header "$hat › $group" "WORKSPACES" \
+            "a workspace is a tmux session named <hat>-<subproject>, shown as one" \
+            "entry in the cmux sidebar. Its tabs are the tmux windows inside it."
+
+        i=0
+        while [[ $i -lt $n ]]; do
+            ws="${WSS[$i]}"
+            tabs=$(edit_session_field "$hat" "$ws" 2)
+            att=$(edit_session_field "$hat" "$ws" 3)
+            if [[ -n "$tabs" ]]; then
+                state=$(printf '%s● running%s  %s tab(s)' "$C_GR" "$C_R" "$tabs")
+                [[ "$att" == "1" ]] && state="$state  ${C_DIM}attached${C_R}"
+            else
+                state=$(printf '%s✗ not running%s  %sre-create with restore%s' \
+                        "$C_RD" "$C_R" "$C_DIM" "$C_R")
+            fi
+            ROW_LABEL=""; ROW_ICON="$ICON_WORKSPACE"
+            edit_row $((i+1)) "$SEL" "$ws" 26 "$state"
+            i=$((i+1))
+        done
+        [[ $n -eq 0 ]] && printf '   %s(no workspaces in this group yet - press a)%s\n' "$C_DIM" "$C_R"
+
+        edit_keys "a add   r rename   d delete   ! refresh   q quit"
+        edit_readkey
+        edit_nav "$KEY" "$n" && continue
+        ws="${WSS[$((SEL-1))]:-}"
+        case "$KEY" in
+            q|Q|quit) return 1 ;;
+            left|esc|back|h) return 0 ;;
+            enter|right|l)
+                [[ $n -gt 0 ]] && { edit_tabs "$hat" "$group" "$ws" || return 1; }
+                : ;;
+            !) edit_fetch_hat "$hat" ;;
+            a|A)
+                edit_ask "new workspace name (a bare name gets the '$hat-' prefix)"
+                if [[ -n "$EDIT_REPLY" ]]; then
+                    cmd_new "$EDIT_REPLY" --group "$group" --hat "$hat" || true
+                    edit_fetch_hat "$hat"
+                fi
+                edit_pause ;;
+            r|R)
+                [[ $n -eq 0 ]] && continue
+                edit_ask "new name for workspace '$ws'"
+                if [[ -n "$EDIT_REPLY" ]]; then
+                    cmd_rename "$ws" "$EDIT_REPLY" || true; edit_fetch_hat "$hat"
+                fi
+                edit_pause ;;
+            d|D)
+                [[ $n -eq 0 ]] && continue
+                if edit_confirm "kill tmux session '$ws' and forget it? this ends everything running in it"; then
+                    remote_sh "$(hat_ssh "$hat")" "tmux kill-session -t $(sq "=$ws")" >/dev/null 2>&1 || true
+                    jq_write --arg g "$group" --arg s "$ws" 'del(.groups[$g].sessions[$s])'
+                    info "Deleted workspace '$ws'"
+                    edit_fetch_hat "$hat"; edit_pause
+                fi ;;
+        esac
+    done
+}
+
+# --- level 4: tabs ----------------------------------------------------------
+
+edit_tabs() {
+    local hat="$1" group="$2" ws="$3" SEL=1 n i
+    local idx nm active panes cmd cwd dead mark short plural
+    while :; do
+        IDXS=(); NAMES=(); METAS=(); n=0
+        while IFS=$'\t' read -r idx nm active panes cmd cwd dead; do
+            [[ -z "$idx" ]] && continue
+            if [[ "$dead" == "1" ]]; then mark="${C_RD}✗ dead${C_R}   "
+            elif [[ "$active" == "1" ]]; then mark="${C_GR}● active${C_R} "
+            else mark="${C_DIM}○${C_R}        "
+            fi
+            short=$(edit_trunc_left "$(edit_short_path "$cwd")" 30)
+            plural=" "; [[ "$panes" != "1" ]] && plural="s"
+            IDXS[$n]="$idx"
+            NAMES[$n]="${nm:-(unnamed)}"
+            METAS[$n]=$(printf '%s %s%-10s%s %s%s pane%s  %s%s' \
+                "$mark" "$C_CY" "$(edit_trunc "$cmd" 10)" "$C_R" \
+                "$C_DIM" "$panes" "$plural" "$short" "$C_R")
+            n=$((n+1))
+        done < <(edit_windows "$hat" "$ws")
+        [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
+
+        edit_header "$hat › $group › $ws" "TABS" \
+            "a tab is a tmux window inside the workspace. It survives losing the" \
+            "client, and closing it here closes it everywhere."
+
+        i=0
+        while [[ $i -lt $n ]]; do
+            ROW_LABEL=""; ROW_ICON="$ICON_TAB"
+            edit_row $((i+1)) "$SEL" "${NAMES[$i]}" 22 "${METAS[$i]}"
+            i=$((i+1))
+        done
+        [[ $n -eq 0 ]] && \
+            printf '   %s(workspace is not running - go back and use restore)%s\n' "$C_YL" "$C_R"
+
+        edit_keys "a add   r rename   d close   ! refresh   q quit"
+        edit_readkey
+        edit_nav "$KEY" "$n" && continue
+        idx="${IDXS[$((SEL-1))]:-}"
+        case "$KEY" in
+            q|Q|quit) return 1 ;;
+            left|esc|back|h) return 0 ;;
+            enter|right|l) : ;;                       # tabs are the leaf level
+            !) : ;;
+            a|A)
+                edit_ask "name for the new tab (blank for the shell default)"
+                cmd_tab "$ws" "$EDIT_REPLY" || true; edit_pause ;;
+            r|R)
+                [[ $n -eq 0 ]] && continue
+                edit_ask "new name for tab '${NAMES[$((SEL-1))]}'"
+                [[ -n "$EDIT_REPLY" ]] && remote_sh "$(hat_ssh "$hat")" \
+                    "tmux rename-window -t $(sq "=$ws:$idx") $(sq "$EDIT_REPLY")" >/dev/null 2>&1 || true ;;
+            d|D)
+                [[ $n -eq 0 ]] && continue
+                if edit_confirm "close tab '${NAMES[$((SEL-1))]}'? whatever is running in it is killed"; then
+                    remote_sh "$(hat_ssh "$hat")" \
+                        "tmux kill-window -t $(sq "=$ws:$idx")" >/dev/null 2>&1 || true
+                fi ;;
+        esac
+    done
+}
+
+cmd_edit() {
+    [[ -t 0 && -t 1 ]] || die "edit needs an interactive terminal"
+    colour_setup
+    EDIT_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/hatter-edit.XXXXXX")
+    trap edit_cleanup EXIT INT TERM
+    edit_refresh_all
+    edit_top
+    printf '\033[H\033[2J\033[?25h'
+    edit_cleanup
+}
+
+usage_main() {
+    cat <<'USAGE'
+hatter - cmux windows, groups and workspaces backed by remote tmux
+
+  hat        a login (user@host): one ssh connection, one tmux server, one window
+  group      a project or area within a hat
+  workspace  a tmux session named <hat>-<subproject>
+  tab        a tmux window inside that session
+  credential a Claude login, held on this Mac by cswap and pushed to a hat
+
+Commands:
+  new <session>          Create or reattach a workspace  ("new" is optional)
+  tab <session> [name]   Add a tab to a workspace
+  rename <old> <new>     Rename a session on its server, in cmux and in config
+  hat <subcommand>       Manage hats (shell servers)
+  group <subcommand>     Manage groups (projects)
+  edit                   Interactive browser: navigate and edit every level
+  creds <subcommand>     Push a Claude login from this Mac to a hat
+  autosave <subcommand>  Rolling config snapshots, and the timer that takes them
+  list                   Show the whole hat / group / workspace tree
+  sync                   Record the live layout into the config
+  restore [hat|group]    Rebuild the layout from the config
+  provision <hat>        Set up tmux persistence on a shell server
+  backup [message]       sync, then commit and push the config to git
+
+Run `hatter <command>` or `hatter help <command>` for a command's options.
+
+Config: ~/.config/hatter/config.json
+USAGE
+}
+
+usage_cmd() {
+    case "$1" in
+    creds|cred|credential|credentials) cat <<'USAGE'
+hatter creds [subcommand]
+
+A credential is one Claude login. They live on this Mac only - in the macOS
+Keychain, managed by cswap - and are pushed to a hat over ssh when Claude Code
+on that server needs to run as an account. No shell server is ever asked to log
+in, and nothing is written to disk on either side: the export goes straight down
+the ssh pipe and lands 0600 on the server.
+
+  list                   Credentials (lettered) and the hat each one is on
+  push <sel> <hat>...    Push a credential to one or more hats
+  push <sel> --all       ...to every hat
+  status [hat]           Ask each hat which credential it is holding
+  clear <hat>            Remove the credential from a hat
+
+<sel> is the letter from `hatter creds`, the cswap slot number, or enough of
+the email address to be unique.
+
+One credential per hat is the arrangement to aim for. Sharing one account
+across machines works, but each machine refreshes the OAuth token on its own
+and a refresh can rotate the refresh token, so a shared account may get logged
+out from under whichever machine refreshed last. Pushing again fixes it;
+different accounts per hat avoid it.
+
+An *expired* access token is not a problem - Claude Code trades the refresh
+token for a new one by itself. Only a credential reported as "dead" (expired
+with no refresh token) needs pushing again.
+
+Requires cswap on this Mac and `hatter provision <hat>` on the server.
+USAGE
+    ;;
+    autosave) cat <<'USAGE'
+hatter autosave [subcommand]
+
+Snapshots of config.json, kept separately from git.
+
+  run                Sync from the live client, then snapshot (what the timer runs)
+  now                Snapshot only, no sync
+  list               Show the checkpoints and the rolling save
+  restore <n|latest> Roll the config back to one of them
+  install            Install the launchd timer (every 60s)
+  uninstall          Remove the timer, keeping the snapshots
+  status             Is the timer loaded, and how many snapshots exist
+
+Two layers, on purpose:
+
+  latest.json            rewritten whenever the config changes - after every
+                         hatter run, and once a minute from the timer, which is
+                         how renames done inside cmux get picked up.
+
+  config-<window>.json   the config as each 8-hour window opened. Frozen once
+                         written, so eight checkpoints are eight different
+                         moments - roughly the last two and a half days. The
+                         oldest is dropped past eight.
+
+Neither touches git. `hatter backup [message]` is the deliberate checkpoint:
+a real commit, pushed to the dotfiles remote, kept forever. Autosaves are for
+"undo the last hour"; backups are for "what did this look like last month".
+
+After rolling back, `hatter restore` applies the config to the client.
+USAGE
+    ;;
+    new) cat <<'USAGE'
+hatter new <session> [options]        ("new" is optional: `hatter <session>`)
+
+Create or reattach a tmux session and surface it as a workspace, in the right
+group, in the right hat's window. Creates the group and the hat's window if
+they do not exist yet.
+
+Options:
+  --group <name>     Project/area to put it in. Created if new. Defaults to the
+                     hat's default_group from the config.
+  --hat <hat>        Which shell server. Needed only when the session name has
+                     no <hat>- prefix and the group is also new.
+  --ssh user@host    Register an unknown hat's destination without prompting.
+  --dir <path>       Remote working directory for a newly registered hat.
+
+A bare name is auto-prefixed once the hat is known:
+  hatter dev-atlas --group "Atlas"
+  hatter atlas --group "Atlas"                # -> dev-atlas, hat from group
+  hatter atlas --group "New Project" --hat dev
+USAGE
+    ;;
+    tab) cat <<'USAGE'
+hatter tab <session> [tab-name]
+
+Add a tab to a workspace. A tab is a tmux window, so this creates one on the
+server and the mirror picks it up. Inside the session, tmux's own `prefix + c`
+does the same thing.
+
+  hatter tab dev-atlas
+  hatter tab dev-atlas notes
+USAGE
+    ;;
+    rename) cat <<'USAGE'
+hatter rename <old-session> <new-session>
+
+Rename a session in all three places at once: the tmux session on its server,
+the cmux workspace title, and the config. Renaming in the cmux sidebar also
+renames the tmux session, so after doing it by hand just run `hatter sync`.
+
+  hatter rename dev-website-parser dev-website-grid
+USAGE
+    ;;
+    hat) cat <<'USAGE'
+hatter hat <subcommand>
+
+A hat is a login: one user@host, one ssh connection, one tmux server, and one
+cmux window. The hat name is the prefix on every session that belongs to it.
+
+Subcommands:
+  list                                    Hats and their destinations
+  status                                  Live probe: reachable, tmux, sessions
+  add <hat> --ssh user@host [--dir path] [--group <name>]
+                                          Register or update a hat. --group sets
+                                          the default group new workspaces land
+                                          in when you omit --group.
+  rename <old> <new>                      Rename a hat and re-prefix its sessions
+  rm <hat>                                Forget a hat (server untouched)
+
+  hatter hat add cloud --ssh you@shell.example.com
+  hatter hat status
+USAGE
+    ;;
+    group) cat <<'USAGE'
+hatter group <subcommand>
+
+A group is a project or area inside one hat. Group names are free text and do
+not take the hat prefix; the workspaces inside them do.
+
+Subcommands:
+  list                          Groups, their hats, and their sessions
+  add <name> --hat <hat>        Create a group (also creates the hat's window)
+  rename <old> <new>            Rename it in cmux and in the config together
+  rm <name>                     Forget a group (cmux group left alone)
+
+  hatter group add "Atlas" --hat dev
+USAGE
+    ;;
+    edit) cat <<'USAGE'
+hatter edit
+
+An interactive walk down the whole structure:
+
+  hat  >  group  >  workspace  >  tab
+
+Every screen names the level it is showing and says what that level is, so the
+vocabulary is learned by looking around. Add, rename and remove are available at
+each one, and live status is shown where it exists:
+
+  hats        up / no tmux server, and how many workspaces
+  workspaces  running / not running, tab count, whether a client is attached
+  tabs        active, dead, running command, pane count, working directory
+
+Keys are shown at the bottom of each screen. `!` re-probes the servers, `b`
+goes back a level, `q` quits from anywhere. Takes no options.
+USAGE
+    ;;
+    list) cat <<'USAGE'
+hatter list
+
+Show the whole tree from the config - every hat, its groups, and each group's
+workspaces with tab counts - followed by the cmux windows that are actually
+open. Takes no options. For live server state instead, use `hatter hat status`.
+USAGE
+    ;;
+    sync) cat <<'USAGE'
+hatter sync
+
+Record the live layout into the config: group membership, titles, colors,
+pin/collapse, and every session's tabs and working directories. Run it after
+renaming or rearranging anything in the cmux sidebar. Takes no options.
+
+Only hats with an open window and a reachable server are touched; the rest are
+left as they are rather than being emptied.
+USAGE
+    ;;
+    restore) cat <<'USAGE'
+hatter restore [hat|group ...]
+
+Rebuild from the config after a Mac or shell-server reboot: recreate missing
+tmux sessions and their tabs, find or open each hat's window, re-mirror, put the
+workspaces back in their groups, and re-apply styling. Idempotent.
+
+With no arguments, every hat. Hats with nothing recorded, or whose server is
+unreachable, are skipped rather than failing the run.
+
+  hatter restore
+  hatter restore dev
+USAGE
+    ;;
+    backup) cat <<'USAGE'
+hatter backup [message]
+
+Run `sync`, then commit and push ~/.config/hatter to git. The config is a small
+JSON file - hostnames and usernames, no secrets - but it maps your
+infrastructure, so keep the remote private.
+
+Nothing here is product-specific; any git remote reachable over ssh works. A
+bare repo on a box you already own is enough:
+
+  you@shell.example.com:git/dotfiles.git
+
+On a new Mac:
+  git clone <remote> ~/.config/hatter
+  hatter restore
+
+The bootstrap secret is your ssh key, not this repo - keep that in a password
+manager so a bare machine can reach the remote in the first place.
+USAGE
+    ;;
+    provision) cat <<'USAGE'
+hatter provision <hat|user@host>
+
+Set up a shell server so its state survives both a reboot and a stray logout:
+
+  - tpm, tmux-resurrect and tmux-continuum, autosaving every 15 minutes and
+    restoring on tmux server start
+  - every pane's login shell wrapped in a loop, so `exit` and ctrl-D hand back
+    a fresh prompt instead of closing the tab by accident
+  - a `bye` command on the server for closing one deliberately:
+      bye            close this pane / tab
+      bye window     close the whole tmux window
+      bye session    close the session, and the cmux workspace with it
+    `exit 99` does the same thing without the script. 99 rather than 1 because
+    bare `exit` returns the last command's status, so 1 would fire by accident.
+
+Rewrites its managed block in ~/.tmux.conf on every run, then self-tests that a
+shell which exits comes back usable. Takes no options.
+USAGE
+    ;;
+    *) usage_main ;;
+    esac
+}
+
+usage_exit() { usage_main; exit 1; }
+
+cmd_help() {
+    if [[ -n "${1:-}" ]]; then
+        usage_cmd "$1"
+    else
+        usage_main
+    fi
+}
+
+# -------------------------------------------------------------------- main
+
+need jq
+need cmux
+seed_config
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    edit|list|ls|help|""|-h|--help|autosave) ;;
+    *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
+       trap hatter_unlock EXIT ;;
+esac
+
+# `hatter <command> --help` always explains the command.
+for a in "$@"; do
+    case "$a" in
+        -h|--help) usage_cmd "$cmd"; exit 0 ;;
+    esac
+done
+
+case "$cmd" in
+    ""|-h|--help)  usage_main; exit 0 ;;
+    help)          cmd_help "${1:-}" ;;
+
+    # These need arguments, so bare invocation shows the command's options.
+    new)       [[ $# -gt 0 ]] || { usage_cmd new; exit 1; };       cmd_new "$@" ;;
+    tab)       [[ $# -gt 0 ]] || { usage_cmd tab; exit 1; };       cmd_tab "$@" ;;
+    rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
+    provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;
+    backup)    cmd_backup "$@" ;;
+    hat|login) [[ $# -gt 0 ]] || { usage_cmd hat; exit 1; };       cmd_hat "$@" ;;
+    group)     [[ $# -gt 0 ]] || { usage_cmd group; exit 1; };     cmd_group "$@" ;;
+
+    # These are meaningful with no arguments, so they just run.
+    edit)      cmd_edit "$@" ;;
+    creds|cred|credential|credentials) cmd_creds "$@" ;;
+    autosave)  cmd_autosave "$@" ;;
+    list|ls)   cmd_list "$@" ;;
+    sync)      cmd_sync "$@" ;;
+    restore)   cmd_restore "$@" ;;
+
+    -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
+    *)         cmd_new "$cmd" "$@" ;;
+esac
+
+# A snapshot after every run. This is only a cmp plus, at most, a file copy -
+# the expensive sync belongs to the timer, not to every command.
+autosave_snapshot >/dev/null 2>&1 || true
