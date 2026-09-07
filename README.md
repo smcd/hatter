@@ -28,7 +28,7 @@ hatter edit
 
     1 ^ work        you@shell.work.com       ● up 3 ws ● you@work.com
     2 ^ personal    you@box.personal.com     ● up 1 ws ● me@personal.com
-    3 ^ project     you@dev.github.com       ○ down    ● dev@github.com
+    3 ^ project     you@dev.github.com       ○ down    ● you@work.com
 ```
 
 ## The model
@@ -63,7 +63,10 @@ restore.
 - **Credentials stay on your machine.** Claude Code logins live in your
   OS keychain and are pushed to a hat over ssh when that server needs one.
   Nothing is written to disk on either side, and no shell server is ever asked
-  to log in.
+  to log in. One login can sit on as many hats as you like — `creds push a
+  --all` puts it on every one — while a hat holds exactly one at a time,
+  because Claude Code reads a single credentials file. `hatter creds` lists
+  each login with the hats currently holding it.
 - **Autosave and backup.** Rolling snapshots of the config plus one frozen
   checkpoint per 8 hours; `hatter backup` is a real git commit to a remote you
   control.
