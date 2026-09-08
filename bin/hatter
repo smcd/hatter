@@ -204,6 +204,12 @@ migrate_config() {
 
 # -------------------------------------------------------------- config reads
 
+# tmux will not hold a "." or a ":" in a session name - it substitutes "_" and
+# says nothing. Everything downstream (the config key, the cmux workspace title,
+# every -t target) has to be the name tmux actually used, so the substitution
+# happens here, once, before any of it is written down.
+tmux_session_name() { printf '%s' "${1//[.:]/_}"; }
+
 hat_exists() { [[ -n "$(cfg --arg l "$1" '.hats[$l] // empty')" ]]; }
 # "-oProxyCommand=..." is a valid ssh argument and would run whatever it says.
 # A destination is never an option, so anything that looks like one is refused
@@ -1001,6 +1007,10 @@ cmd_new() {
         esac
     done
     [[ -n "$session" ]] || usage_exit
+    local given="$session"
+    session=$(tmux_session_name "$session")
+    [[ "$session" == "$given" ]] || \
+        warn "tmux cannot hold '.' or ':' in a session name - using '$session'"
 
     # Work out the hat, most specific source first: an explicit --hat, then an
     # existing record for this session, then the group it is going into, then
@@ -1060,7 +1070,11 @@ cmd_new() {
     mirror_hat "$hat" "$win"
 
     wref=$(wait_for_workspace "$session" "$win")
-    [[ -n "$wref" ]] || die "tmux session '$session' exists on $host but no cmux workspace appeared"
+    if [[ -z "$wref" ]]; then
+        warn "tmux session '$session' is running on $host, but cmux has not mirrored it"
+        warn "the session and the config entry are both fine - retry with: hatter new $session"
+        die "no cmux workspace appeared for '$session'"
+    fi
 
     cmux workspace-group add --group "$gref" --workspace "$wref" >/dev/null
     apply_group_style "$group" "$gref"
@@ -1175,6 +1189,10 @@ cmd_rename() {
     # Rename a session everywhere at once: on the server, in cmux, in the config.
     local old="${1:-}" new="${2:-}"
     [[ -n "$old" && -n "$new" ]] || die "usage: hatter rename <old-session> <new-session>"
+    local given="$new"
+    new=$(tmux_session_name "$new")
+    [[ "$new" == "$given" ]] || \
+        warn "tmux cannot hold '.' or ':' in a session name - using '$new'"
 
     local group hat host
     group=$(session_group "$old")
