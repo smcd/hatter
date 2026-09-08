@@ -2296,7 +2296,7 @@ edit_nav() {
 # through both; a letter or a digit jumps straight into either one.
 
 edit_top() {
-    local SEL=1 nc nh nt i idx hat host state sess cred credstate dot dirty=1
+    local SEL=1 nc nh nt i idx hat host state scol sess cred credstate dot dirty=1
     local cols lastcols="" hdrtail
     local letter slot email label r5 r7 e5 e7 active holders
     while :; do
@@ -2330,13 +2330,16 @@ edit_top() {
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
                 host=$(hat_ssh "$hat")
+                # Plain text and its colour kept apart: %-14s counts bytes, and
+                # padding a string that already has escapes in it pads the
+                # escapes too, so one down hat knocked every column out.
                 if [[ -s "$(edit_sessions_file "$hat")" ]]; then
                     sess=$(wc -l < "$(edit_sessions_file "$hat")" | tr -d ' ')
-                    state=$(printf '%s● up%s %s ws' "$C_GR" "$C_R" "$sess")
+                    state="● up $sess ws"; scol="$C_GR"
                 elif [[ -f "$(edit_sessions_file "$hat")" ]]; then
-                    state=$(printf '%s○ no tmux%s' "$C_YL" "$C_R")
+                    state="○ no tmux"; scol="$C_YL"
                 else
-                    state=$(printf '%s?  unprobed%s' "$C_DIM" "$C_R")
+                    state="?  unprobed"; scol="$C_DIM"
                 fi
                 cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
                 # Reuse the credential's own dot so a hat shows the health of
@@ -2355,7 +2358,8 @@ edit_top() {
                 esac
                 HATS[$nh]="$hat"
                 HICON[$nh]=$(printf '%b' "$(hat_icon "$hat")")
-                HMETA[$nh]=$(printf '%s%-24s%s %-14s %s' "$C_DIM" "$host" "$C_R" "$state" "$cred")
+                HMETA[$nh]=$(printf '%s%-24s%s %s%-11s%s %s' \
+                    "$C_DIM" "$host" "$C_R" "$scol" "$state" "$C_R" "$cred")
                 nh=$((nh+1))
             done < <(hat_names)
             dirty=0

@@ -15,25 +15,10 @@ projection of them, rebuilt from a single config file.
 hatter
 ```
 
-```
-  HATS  ·  a hat is a login (user@host): one ssh connection,
-     one tmux server, one cmux window.
+<p align="center">
+  <img src="rack.svg" alt="The hatter rack: three hats - dev, ops and personal - each with its ssh destination, whether its tmux server is up, and the Claude login it holds; below them six logins with coloured 5h and 7d capacity bars and the hats holding each." width="900">
+</p>
 
- ▸  1 /_\ dev         you@shell.work.com       ● up 3 ws ● claude-1
-    2 /_\ ops         you@ops.work.com         ○ down    ● claude-3
-    3 /_\ personal    you@box.personal.com     ● up 1 ws ● you.example
-
-  CREDENTIALS  ·  one Claude login each. Bars are capacity left,
-     then time to reset; red is spent, amber under half a session.
-
-        LOGIN                 5H WINDOW             7D WINDOW            HELD BY
-    a ● claude-1@work.com     5h ░░░░░░   0%   2h   7d █████░  87%  19h  -> dev
-    b ● claude-2@work.com     5h ██░░░░  34%   1h   7d ████░░  66%   2d
-    c ● claude-3@work.com     5h ██████ 100%   4h   7d █████░  82%   2d  -> ops
-    d ● claude-4@work.com     5h ████░░  71%  40m   7d ██████  95%   3d
-    e ● claude-5@work.com     5h ██████ 100%   5h   7d ██████ 100%   5d
-    f ● you.example@gmail.com 5h ███░░░  46%   1h   7d ████░░  71%   2d  -> personal
-```
 
 ## The model
 
