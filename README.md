@@ -1,7 +1,7 @@
 # hatter
 
 <p align="center">
-  <img src="banner.svg" alt="A wizard hat with terminal boxes inside it - bash, claude, codex, tmux, ssh, vim, git, htop - and two more hats behind it." width="640">
+  <img src="banner.svg" alt="A wizard hat with terminal boxes inside it - bash, claude, codex, tmux, ssh, cmux and git - and two more hats behind it." width="640">
 </p>
 
 Which hat are you wearing right now?
