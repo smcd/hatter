@@ -3065,11 +3065,19 @@ cmd_help() {
 # -------------------------------------------------------------------- main
 
 need jq
-need cmux
 seed_config
 
 cmd="${1:-}"
 shift || true
+
+# cmux is the client half, and it is macOS-only. The server half - provisioning
+# a shell server, pushing a login to it, adding a tab, backups - is bash, ssh
+# and jq, which run anywhere, WSL included. So cmux is required by the commands
+# that actually drive it rather than by the script itself.
+case "$cmd" in
+    provision|creds|cred|credential|credentials|backup|autosave|tab|help|-h|--help) ;;
+    *) need cmux ;;
+esac
 
 case "$cmd" in
     rack|edit|list|ls|help|""|-h|--help|autosave) ;;
