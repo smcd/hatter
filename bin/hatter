@@ -391,11 +391,17 @@ ensure_remote_session() {
 
 # ----------------------------------------------------------- cmux primitives
 
+# cmux is macOS-only, and the commands that never drive it no longer demand it.
+# The two entry points that read from it answer "no windows" when it is absent,
+# so `hat status` on a Linux or WSL client reports the server side and leaves
+# the window column empty instead of printing "command not found" per hat.
+have_cmux() { command -v cmux >/dev/null 2>&1; }
+
 # Refs like workspace:3 are window-scoped and collide across windows, so every
 # id this script stores or passes around is a UUID.
-cmux_json() { cmux --id-format both "$@" --json; }
+cmux_json() { have_cmux || return 1; cmux --id-format both "$@" --json; }
 
-window_ids() { cmux list-windows --json | jq -r '.[].id'; }
+window_ids() { have_cmux || return 0; cmux list-windows --json | jq -r '.[].id'; }
 
 groups_in_window() {
     cmux_json workspace-group list --window "$1" 2>/dev/null | jq -r '.groups[]?.name'
@@ -3075,7 +3081,7 @@ shift || true
 # and jq, which run anywhere, WSL included. So cmux is required by the commands
 # that actually drive it rather than by the script itself.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|help|-h|--help) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|help|-h|--help) ;;
     *) need cmux ;;
 esac
 
