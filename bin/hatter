@@ -670,10 +670,21 @@ if [ -z "${TMUX:-}" ]; then
     echo "bye: not inside tmux - plain 'exit' already works here" >&2
     exit 1
 fi
+
+# Every target is explicit. Without -t, tmux does not close the pane the
+# command was typed in: it closes the session's *current* pane, which is a
+# different one whenever another tab is the one tmux considers current - so
+# `bye` in one tab would shut a different tab. $TMUX_PANE is set per pane by
+# tmux itself, and resolves to this pane's window and session too.
+if [ -z "${TMUX_PANE:-}" ]; then
+    echo "bye: TMUX_PANE is not set - refusing to guess which pane to close" >&2
+    echo "bye: use 'exit 99', or tmux kill-pane -t <pane>" >&2
+    exit 1
+fi
 case "${1:-pane}" in
-    pane)       exec tmux kill-pane ;;
-    window|tab) exec tmux kill-window ;;
-    session)    exec tmux kill-session ;;
+    pane)       exec tmux kill-pane    -t "$TMUX_PANE" ;;
+    window|tab) exec tmux kill-window  -t "$TMUX_PANE" ;;
+    session)    exec tmux kill-session -t "$TMUX_PANE" ;;
     *) echo "bye: unknown target '$1' (pane|window|session)" >&2; exit 2 ;;
 esac
 BYE
