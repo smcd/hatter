@@ -41,6 +41,24 @@ rather than pretending:
 - `CanGroup` — if false, flatten groups into a naming convention on tabs/tabs titles
 - `CanStyle` — if false, ignore colour/icon/pin/collapse silently
 
+## Where the seam actually is
+
+Measured 2026-09-10: 19 direct `cmux` calls, funnelling through twelve
+functions. That list *is* the interface, and it is small enough to extract in
+an afternoon:
+
+    cmux_json  window_ids  have_cmux
+    ensure_hat_window  find_hat_window  mirror_hat
+    workspace_ref_by_title  wait_for_workspace  discard_stray_workspace
+    ensure_cmux_group  apply_group_style
+
+Everything else - config, ssh, tmux, credentials, autosave, the rack - never
+touches a client.
+
+Half of the headless case (#6) already exists: cmux is now required by the
+commands that drive it rather than by the script, so `provision`, `creds`,
+`backup`, `autosave`, `tab` and `hat` run on a client with no cmux at all.
+
 ## Acceptance
 
 - [ ] Interface documented with the capability matrix above
